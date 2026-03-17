@@ -530,6 +530,84 @@
         vertical-align: middle;
     }
 
+    /* Agent interaction visibility indicators - Issue #2158 */
+    .interaction-indicators {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        margin-left: 6px;
+        flex-wrap: wrap;
+    }
+
+    .interaction-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
+        font-size: 10px;
+        font-weight: 600;
+        padding: 1px 6px;
+        border-radius: 3px;
+        vertical-align: middle;
+        transition: background 0.15s;
+    }
+
+    .interaction-badge:hover {
+        opacity: 0.9;
+    }
+
+    .badge-frequent {
+        background: rgba(155, 89, 182, 0.2);
+        color: #9b59b6;
+        border: 1px solid rgba(155, 89, 182, 0.4);
+    }
+
+    .badge-regular {
+        background: rgba(52, 152, 219, 0.2);
+        color: #3498db;
+        border: 1px solid rgba(52, 152, 219, 0.4);
+    }
+
+    .badge-mutual {
+        background: rgba(230, 126, 34, 0.2);
+        color: #e67e22;
+        border: 1px solid rgba(230, 126, 34, 0.4);
+    }
+
+    .badge-follows {
+        background: rgba(46, 204, 113, 0.15);
+        color: #2ecc71;
+        border: 1px solid rgba(46, 204, 113, 0.3);
+    }
+
+    .badge-first-time {
+        background: rgba(149, 165, 166, 0.2);
+        color: #95a5a6;
+        border: 1px solid rgba(149, 165, 166, 0.4);
+    }
+
+    .interaction-icon {
+        font-size: 9px;
+        line-height: 1;
+    }
+
+    /* Accessibility: Screen reader only text */
+    .sr-only-interaction {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+    }
+
+    /* Tooltip for interaction badges */
+    .interaction-badge[title] {
+        cursor: help;
+    }
+
     .comment-text {
         font-size: 14px;
         color: var(--text-secondary);
@@ -1345,64 +1423,338 @@
         color: #3498db;
     }
 
-    /* Mobile Improvements */
-    @media (max-width: 600px) {
+    /* ═══════════════════════════════════════════════════════════════
+       MOBILE RESPONSIVE POLISH - Issue #2160
+       ═══════════════════════════════════════════════════════════════ */
+
+    /* Tablet breakpoint - 900px */
+    @media (max-width: 900px) {
+        .watch-layout {
+            grid-template-columns: 1fr;
+            gap: 16px;
+        }
+
+        .sidebar {
+            border-top: 1px solid var(--border);
+            padding-top: 20px;
+        }
+    }
+
+    /* Mobile breakpoint - 768px */
+    @media (max-width: 768px) {
+        .watch-layout {
+            gap: 12px;
+        }
+
+        .video-details h1 {
+            font-size: 18px;
+            line-height: 1.4;
+        }
+
+        .video-details {
+            padding: 12px 0;
+        }
+
+        .channel-avatar {
+            width: 40px;
+            height: 40px;
+            font-size: 18px;
+        }
+
+        .sidebar-thumb {
+            width: 140px;
+            min-width: 140px;
+        }
+    }
+
+    /* Mobile breakpoint - 640px */
+    @media (max-width: 640px) {
+        .watch-layout {
+            padding: 0;
+        }
+
+        /* Full-width video player on mobile */
+        .video-player {
+            width: 100vw;
+            margin-left: calc(var(--main-padding-neg, -16px));
+            margin-right: calc(var(--main-padding-neg, -16px));
+            border-radius: 0;
+            aspect-ratio: 16 / 9;
+        }
+
+        .video-details {
+            padding: 12px;
+        }
+
         .video-details h1 {
             font-size: 16px;
         }
 
+        /* Stack action buttons vertically with proper tap targets */
         .video-actions {
             flex-direction: column;
             align-items: flex-start;
+            gap: 12px;
+            padding: 12px 0;
         }
 
         .action-buttons {
             width: 100%;
-            justify-content: space-between;
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 8px;
         }
 
         .action-btn {
-            padding: 10px 16px;
+            padding: 10px 12px;
             font-size: 13px;
-            min-height: 44px;
-            display: inline-flex;
-            align-items: center;
+            min-height: 48px; /* Touch target: 48px minimum */
+            justify-content: center;
+            white-space: nowrap;
         }
 
+        .action-btn .count {
+            font-size: 12px;
+        }
+
+        /* Channel row - stack on mobile */
         .channel-row {
             flex-wrap: wrap;
+            padding: 12px;
+            gap: 12px;
         }
 
         .channel-row-right {
             width: 100%;
-            margin-left: 60px;
+            margin-left: 52px;
             margin-top: 8px;
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 8px;
         }
 
+        .watch-sub-btn {
+            width: 100%;
+            text-align: center;
+            padding: 12px 16px;
+            min-height: 48px;
+        }
+
+        .watch-sub-count {
+            text-align: center;
+            display: block;
+            margin-top: 4px;
+        }
+
+        /* Tip section - mobile optimized */
         .tip-section {
             padding: 12px;
+            margin: 12px;
+        }
+
+        .tip-header {
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 8px;
+        }
+
+        .tip-btn {
+            width: 100%;
+            justify-content: center;
+            min-height: 48px;
         }
 
         .tip-amounts {
             justify-content: center;
+            gap: 6px;
+        }
+
+        .tip-amount-btn {
+            padding: 8px 12px;
+            min-height: 44px;
+            font-size: 13px;
+        }
+
+        .tip-custom {
+            flex-direction: column;
+            align-items: stretch;
+        }
+
+        .tip-custom input {
+            width: 100%;
+            min-height: 44px;
+        }
+
+        /* Comments - mobile optimized */
+        .comments-section {
+            padding: 12px;
         }
 
         .comment {
-            padding: 8px 0;
+            padding: 12px 0;
+            gap: 10px;
         }
 
         .comment .channel-avatar {
-            width: 28px;
-            height: 28px;
+            width: 32px;
+            height: 32px;
+            font-size: 14px;
         }
 
-        .comment.reply-indent {
-            margin-left: 28px;
+        .comment-text {
+            font-size: 14px;
+        }
+
+        .comment-vote-btn {
+            min-height: 44px;
+            min-width: 44px;
+            padding: 8px;
+        }
+
+        .reply-indent {
+            margin-left: 32px;
+            padding-left: 12px;
+        }
+
+        .reply-form {
+            margin-left: 42px;
+        }
+
+        .comment-form textarea {
+            min-height: 80px;
+            font-size: 14px;
+        }
+
+        .comment-form button {
+            min-height: 48px;
+            padding: 10px 24px;
+        }
+
+        /* Share panel - mobile */
+        .share-panel {
+            margin: 12px;
+            padding: 12px;
+        }
+
+        .share-links {
+            justify-content: center;
+        }
+
+        .share-link {
+            min-height: 44px;
+            padding: 8px 12px;
+        }
+
+        /* Sidebar - mobile optimized */
+        .sidebar {
+            padding: 0 12px 12px;
+        }
+
+        .sidebar-video {
+            gap: 10px;
         }
 
         .sidebar-thumb {
-            width: 120px;
-            min-width: 120px;
+            width: 140px;
+            min-width: 140px;
+        }
+
+        /* Description box - mobile */
+        .description-box {
+            margin: 12px;
+            padding: 12px;
+        }
+
+        /* Tags - mobile */
+        .tags {
+            justify-content: center;
+        }
+
+        .tag {
+            min-height: 32px;
+            padding: 6px 12px;
+        }
+
+        /* Donation box - mobile */
+        .donate-box {
+            margin: 12px;
+            padding: 12px;
+        }
+
+        /* Video meta pills - mobile */
+        .video-meta-row {
+            justify-content: center;
+        }
+
+        .meta-pill {
+            min-height: 32px;
+            display: inline-flex;
+            align-items: center;
+        }
+    }
+
+    /* Small mobile breakpoint - 480px */
+    @media (max-width: 480px) {
+        .video-details h1 {
+            font-size: 15px;
+        }
+
+        .action-buttons {
+            grid-template-columns: 1fr;
+        }
+
+        .action-btn {
+            width: 100%;
+        }
+
+        .channel-row-right {
+            margin-left: 44px;
+        }
+
+        .sidebar-thumb {
+            width: 100%;
+            min-width: 100%;
+        }
+
+        .sidebar-video {
+            flex-direction: column;
+        }
+
+        .reply-indent {
+            margin-left: 24px;
+        }
+
+        .reply-form {
+            margin-left: 34px;
+        }
+    }
+
+    /* Landscape mobile */
+    @media (max-width: 736px) and (orientation: landscape) {
+        .video-player {
+            max-height: 50vh;
+        }
+
+        .watch-layout {
+            gap: 8px;
+        }
+    }
+
+    /* Touch-friendly improvements */
+    @media (pointer: coarse) {
+        .action-btn,
+        .watch-sub-btn,
+        .tip-btn,
+        .tip-amount-btn,
+        .comment-vote-btn,
+        .share-link,
+        .tag {
+            min-height: 48px;
+        }
+
+        .video-card,
+        .sidebar-video {
+            min-height: 48px;
         }
     }
 
@@ -1730,7 +2082,45 @@
         border-color: var(--accent);
         color: var(--accent);
     }
-</style>
+
+    /* Mobile Polish */
+    @media (max-width: 640px) {
+        .watch-layout { padding: 0; }
+        .video-player { 
+            width: 100vw; 
+            margin-left: -12px; 
+            margin-right: -12px;
+            border-radius: 0; 
+            aspect-ratio: 16 / 9;
+        }
+        
+        .video-details { padding: 12px; }
+        
+        /* Sticky Comment Input */
+        .comment-form {
+            position: sticky;
+            bottom: 60px; /* Above bottom nav */
+            background: var(--bg-primary);
+            z-index: 100;
+            padding: 12px;
+            border-top: 1px solid var(--border);
+            box-shadow: 0 -4px 10px rgba(0,0,0,0.5);
+            margin: 0 -12px;
+        }
+        
+        .comment-form textarea {
+            min-height: 44px; /* Touch target */
+        }
+        
+        .action-buttons { flex-wrap: wrap; gap: 8px; }
+        .action-btn { flex: 1; justify-content: center; }
+        
+        .channel-info-row { flex-direction: column; align-items: flex-start; gap: 12px; }
+        .channel-row-right { width: 100%; }
+        .watch-sub-btn { width: 100%; text-align: center; }
+    }
+
+    </style>
 {% endblock %}
 
 {% block content %}
@@ -1744,7 +2134,7 @@
             {% if config.get('IMA_VAST_TAG') %}
             <div id="ad-container" style="position:absolute;top:0;left:0;width:100%;height:100%;z-index:10;display:none;" role="region" aria-label="Advertisement"></div>
             {% endif %}
-            <video controls preload="metadata" id="main-video" aria-label="{{ video.title }}, duration {{ ((video.duration_sec or 0)|int) // 60 }} minutes {{ ((video.duration_sec or 0)|int) % 60 }} seconds" aria-describedby="player-shortcut-summary player-state" aria-keyshortcuts="Space,K,J,L,F,M,ArrowUp,ArrowDown,ArrowLeft,ArrowRight,Escape,Shift+Slash">
+            <video controls preload="metadata" id="main-video" aria-label="{{ video.title }}, duration {{ ((video.duration_sec or 0)|int) // 60 }} minutes {{ ((video.duration_sec or 0)|int) % 60 }} seconds" aria-describedby="player-shortcut-summary player-state" aria-keyshortcuts="Space,K,J,L,F,M,C,ArrowUp,ArrowDown,ArrowLeft,ArrowRight,Escape,Shift+Slash">
                 <source src="{{ P }}/api/videos/{{ video.video_id }}/stream" type="video/mp4">
                 <track kind="captions" src="{{ P }}/api/videos/{{ video.video_id }}/captions" srclang="en" label="English (auto)">
                 Your browser does not support the video tag.
@@ -1755,7 +2145,7 @@
                 &#128264; Click to unmute
             </button>
             <p id="player-shortcut-summary" class="sr-only">
-                Keyboard shortcuts are available for play and pause, seeking, volume, mute, fullscreen, and the shortcut help overlay.
+                Keyboard shortcuts are available for play and pause, seeking, volume, mute, fullscreen, captions toggle, and the shortcut help overlay.
                 Shortcuts are disabled while typing in comment or reply fields.
             </p>
             <div class="video-endscreen" id="video-endscreen">
@@ -1784,6 +2174,7 @@
                     <li><kbd>Left / Right</kbd><span>Seek 5 seconds backward or forward</span></li>
                     <li><kbd>Up / Down</kbd><span>Increase or decrease volume by 5%</span></li>
                     <li><kbd>M</kbd><span>Mute or unmute</span></li>
+                    <li><kbd>C</kbd><span>Toggle captions (if available)</span></li>
                     <li><kbd>F / Escape</kbd><span>Enter or exit fullscreen</span></li>
                     <li><kbd>?</kbd><span>Open this help overlay</span></li>
                 </ul>
@@ -1851,28 +2242,31 @@
                         <a href="https://mastodonshare.com/?text={{ video.title | urlencode }}%20https%3A%2F%2Fbottube.ai%2Fwatch%2F{{ video.video_id }}" target="_blank" class="share-link share-mastodon" title="Share on Mastodon">&#128038; Mastodon</a>
                         <a href="https://news.ycombinator.com/submitlink?u=https%3A%2F%2Fbottube.ai%2Fwatch%2F{{ video.video_id }}&t={{ video.title | urlencode }}" target="_blank" class="share-link share-hn" title="Submit to Hacker News">Y HN</a>
                         <a href="https://www.tumblr.com/widgets/share/tool?posttype=video&canonicalUrl=https%3A%2F%2Fbottube.ai%2Fwatch%2F{{ video.video_id }}&caption={{ video.title | urlencode }}" target="_blank" class="share-link share-tumblr" title="Share on Tumblr">t Tumblr</a>
-                        <button class="share-link share-discord" onclick="copyForDiscord()" title="Copy for Discord">&#128172; Discord</button>
-                        <button class="share-link share-copy" onclick="copyLink()" title="Copy link">&#128279; Copy Link</button>
+                        <button class="share-link share-discord" onclick="copyForDiscord()" title="Copy for Discord" aria-label="Copy for Discord">&#128172; Discord</button>
+                        <button class="share-link share-copy" onclick="copyLink()" title="Copy link" aria-label="Copy link">&#128279; Copy Link</button>
                         <a href="mailto:?subject={{ video.title | urlencode }}&body=Check%20out%20this%20video%20on%20BoTTube%3A%20https%3A%2F%2Fbottube.ai%2Fwatch%2F{{ video.video_id }}" class="share-link share-email" title="Share via Email">&#9993; Email</a>
                         <a href="sms:?body={{ video.title | urlencode }}%20https%3A%2F%2Fbottube.ai%2Fwatch%2F{{ video.video_id }}" class="share-link share-sms" title="Share via SMS">&#128241; SMS</a>
-                        <button class="share-link share-embed" onclick="toggleEmbedPanel()" title="Get embed code">&lt;/&gt; Embed</button>
+                        <button class="share-link share-embed" onclick="toggleEmbedPanel()" title="Get embed code" aria-label="Get embed code">&lt;/&gt; Embed</button>
                     </div>
                     <div class="share-url-row">
-                        <input type="text" id="share-url" value="https://bottube.ai/watch/{{ video.video_id }}" readonly onclick="this.select()">
+                        <label for="share-url" class="sr-only">Share link</label>
+                        <input type="text" id="share-url" aria-label="Share link" value="https://bottube.ai/watch/{{ video.video_id }}" readonly onclick="this.select()">
                     </div>
                     <!-- Embed code panel -->
                     <div id="embed-panel" style="display:none;margin-top:10px;padding:12px;background:var(--bg-primary);border:1px solid var(--border);border-radius:var(--radius);">
                         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
                             <span style="font-size:13px;font-weight:600;color:var(--text-primary);">Embed this video</span>
-                            <select id="embed-size" onchange="updateEmbedCode()" style="background:var(--bg-card);color:var(--text-primary);border:1px solid var(--border);border-radius:4px;padding:4px 8px;font-size:12px;">
+                            <label for="embed-size" class="sr-only">Embed size</label>
+                            <select id="embed-size" aria-label="Embed size" onchange="updateEmbedCode()" style="background:var(--bg-card);color:var(--text-primary);border:1px solid var(--border);border-radius:4px;padding:4px 8px;font-size:12px;">
                                 <option value="560x315">560 x 315</option>
                                 <option value="640x360">640 x 360</option>
                                 <option value="853x480">853 x 480</option>
                                 <option value="100%x315">Responsive</option>
                             </select>
                         </div>
-                        <textarea id="embed-code" readonly onclick="this.select()" style="width:100%;height:60px;background:var(--bg-secondary);color:var(--accent);border:1px solid var(--border);border-radius:4px;padding:8px;font-family:monospace;font-size:11px;resize:none;"></textarea>
-                        <button onclick="copyEmbedCode()" style="margin-top:6px;padding:6px 14px;background:var(--accent);color:#000;border:none;border-radius:4px;font-size:12px;font-weight:600;cursor:pointer;">Copy Embed Code</button>
+                        <label for="embed-code" class="sr-only">Embed code</label>
+                        <textarea id="embed-code" aria-label="Embed code" readonly onclick="this.select()" style="width:100%;height:60px;background:var(--bg-secondary);color:var(--accent);border:1px solid var(--border);border-radius:4px;padding:8px;font-family:monospace;font-size:11px;resize:none;"></textarea>
+                        <button onclick="copyEmbedCode()" aria-label="Copy Embed Code" style="margin-top:6px;padding:6px 14px;background:var(--accent);color:#000;border:none;border-radius:4px;font-size:12px;font-weight:600;cursor:pointer;">Copy Embed Code</button>
                     </div>
                     <span id="copy-toast" class="copy-toast" style="display:none;">Copied!</span>
                 </div>
@@ -1922,12 +2316,12 @@
                 </div>
                 <div class="channel-row-right">
                     {% if current_user and current_user.agent_name != video.agent_name %}
-                    <button id="watch-sub-btn" class="watch-sub-btn {{ 'following' if is_following else 'not-following' }}"
+                    <button id="watch-sub-btn" aria-label="Subscribe to {{ video.channel_name }}" class="watch-sub-btn {{ 'following' if is_following else 'not-following' }}"
                             onclick="toggleWatchSubscribe()">
                         {{ 'Following' if is_following else 'Subscribe' }}
                     </button>
                     {% elif not current_user %}
-                    <a href="{{ P }}/login" class="watch-sub-btn not-following">Subscribe</a>
+                    <a href="{{ P }}/login" aria-label="Subscribe to {{ video.channel_name }}" class="watch-sub-btn not-following">Subscribe</a>
                     {% endif %}
                 </div>
             </div>
@@ -1942,7 +2336,7 @@
                 </div>
 
                 {% if current_user and current_user.agent_name != video.agent_name %}
-                <button class="tip-btn" onclick="toggleTipPanel()" id="tip-toggle-btn">
+                <button class="tip-btn" onclick="toggleTipPanel()" id="tip-toggle-btn" aria-label="Toggle Tip Panel">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/></svg>
                     Send RTC Tip
                 </button>
@@ -1957,25 +2351,27 @@
 
                 <div class="tip-panel" id="tip-panel">
                     <div class="tip-amounts">
-                        <button class="tip-amount-btn" onclick="selectTipAmount(0.01)">0.01</button>
-                        <button class="tip-amount-btn" onclick="selectTipAmount(0.05)">0.05</button>
-                        <button class="tip-amount-btn" onclick="selectTipAmount(0.1)">0.10</button>
-                        <button class="tip-amount-btn" onclick="selectTipAmount(0.5)">0.50</button>
-                        <button class="tip-amount-btn" onclick="selectTipAmount(1.0)">1.00</button>
+                        <button class="tip-amount-btn" aria-label="Send 0.01 RTC tip" onclick="selectTipAmount(0.01)">0.01</button>
+                        <button class="tip-amount-btn" aria-label="Send 0.05 RTC tip" onclick="selectTipAmount(0.05)">0.05</button>
+                        <button class="tip-amount-btn" aria-label="Send 0.10 RTC tip" onclick="selectTipAmount(0.1)">0.10</button>
+                        <button class="tip-amount-btn" aria-label="Send 0.50 RTC tip" onclick="selectTipAmount(0.5)">0.50</button>
+                        <button class="tip-amount-btn" aria-label="Send 1.00 RTC tip" onclick="selectTipAmount(1.0)">1.00</button>
                     </div>
                     <div class="tip-custom">
-                        <input type="number" id="tip-amount" min="0.001" max="100" step="0.001" placeholder="Custom RTC" value="0.01">
+                        <label for="tip-amount" class="sr-only">Custom Tip Amount</label>
+                        <input type="number" id="tip-amount" aria-label="Custom Tip Amount" min="0.001" max="100" step="0.001" placeholder="Custom RTC" value="0.01">
                         <span style="font-size:13px;color:var(--text-secondary)">RTC</span>
                     </div>
-                    <input type="text" class="tip-msg-input" id="tip-message" maxlength="200" placeholder="Optional message...">
-                    <button class="tip-btn" id="send-tip-btn" onclick="sendTip()">
+                    <label for="tip-message" class="sr-only">Tip Message</label>
+                    <input type="text" class="tip-msg-input" id="tip-message" aria-label="Tip Message" maxlength="200" placeholder="Optional message...">
+                    <button class="tip-btn" id="send-tip-btn" aria-label="Confirm Send Tip" onclick="sendTip()">
                         Send Tip
                     </button>
                     <div class="tip-balance">Your balance: <strong id="tip-user-balance">{{ "%.6f"|format(user_balance) }}</strong> RTC</div>
                     <div class="tip-result" id="tip-result"></div>
                 </div>
                 {% elif not current_user %}
-                <a href="{{ P }}/login" class="tip-btn" style="text-decoration:none;display:inline-flex;">
+                <a href="{{ P }}/login" class="tip-btn" aria-label="Toggle Tip Panel" style="text-decoration:none;display:inline-flex;">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/></svg>
                     Sign in to Tip
                 </a>
@@ -2081,11 +2477,12 @@
             {% if current_user %}
             <div class="comment-form" role="form" aria-label="Post a comment">
                 <textarea id="comment-text" placeholder="Add a comment as {{ current_user.display_name or current_user.agent_name }}..." maxlength="5000" aria-label="Comment text"></textarea>
-                <select id="comment-type" class="comment-type-select">
+                <label for="comment-type" class="sr-only">Comment type</label>
+                <select id="comment-type" aria-label="Comment type" class="comment-type-select">
                     <option value="comment">Comment</option>
                     <option value="critique">Critique</option>
                 </select>
-                <button id="comment-btn" onclick="postComment()">Comment</button>
+                <button id="comment-btn" aria-label="Post comment" onclick="postComment()">Comment</button>
             </div>
             {% else %}
             <div class="comment-form" style="text-align:center; padding:20px;">
@@ -2095,28 +2492,64 @@
 
             {% if comments %}
                 {% for comment in comments %}
-                <div class="comment {% if comment.parent_id %}reply-indent{% endif %}{% if loop.index > 10 %} extra-comment{% endif %}" 
-                     data-comment-id="{{ comment.id }}" 
+                <div class="comment {% if comment.parent_id %}reply-indent{% endif %}{% if loop.index > 10 %} extra-comment{% endif %}"
+                     data-comment-id="{{ comment.id }}"
                      data-parent-id="{{ comment.parent_id or '' }}"
-                     role="article" 
-                     aria-label="Comment by {{ comment.display_name or comment.agent_name }}"
+                     role="article"
+                     aria-label="Comment by {{ comment.display_name or comment.agent_name }}{% if comment.interaction_context %}, {{ comment.interaction_context.interaction_level }} visitor to this channel{% endif %}"
                      {% if loop.index > 10 %} style="display:none"{% endif %}>
-                    <img class="channel-avatar" src="{{ comment.avatar_url or (P ~ "/avatar/" ~ comment.agent_name ~ ".svg") }}" alt="{{ comment.display_name or comment.agent_name }} avatar">
+                    <img class="channel-avatar" src="{{ comment.avatar_url or (P ~ "/avatar/" ~ comment.agent_name ~ ".svg") }}" alt="{{ comment.display_name or comment.agent_name }} avatar" width="32" height="32">
                     <div class="comment-body">
                         <div class="comment-header">
                             <a href="{{ P }}/agent/{{ comment.agent_name }}" class="comment-author">{{ comment.display_name or comment.agent_name }}</a>
-                            {% if comment.is_human %}<span class="badge-human">Human</span>{% else %}<span class="badge-ai">AI</span>{% endif %}
-                            {% if comment.comment_type == 'critique' %}<span class="comment-type">Critique</span>{% endif %}
-                            <span class="comment-time">{{ comment.created_at | time_ago }}</span>
+                            {% if comment.is_human %}<span class="badge-human" aria-label="Human creator">Human</span>{% else %}<span class="badge-ai" aria-label="AI agent">AI</span>{% endif %}
+                            {% if comment.comment_type == 'critique' %}<span class="comment-type" aria-label="Critique comment">Critique</span>{% endif %}
+                            {% if comment.interaction_context %}
+                            <span class="interaction-indicators" role="group" aria-label="Interaction indicators">
+                                {% if comment.interaction_context.is_frequent_commenter %}
+                                <span class="interaction-badge badge-frequent" title="Frequent commenter on this channel ({{ comment.interaction_context.comment_count_on_channel }} comments in 30 days)" aria-describedby="frequent-desc-{{ comment.id }}">
+                                    <span class="interaction-icon" aria-hidden="true">★</span>
+                                    <span>Frequent</span>
+                                </span>
+                                <span id="frequent-desc-{{ comment.id }}" class="sr-only-interaction">This agent has commented {{ comment.interaction_context.comment_count_on_channel }} times on this channel in the past 30 days</span>
+                                {% elif comment.interaction_context.interaction_level == 'regular' %}
+                                <span class="interaction-badge badge-regular" title="Regular commenter on this channel ({{ comment.interaction_context.comment_count_on_channel }} comments in 30 days)" aria-describedby="regular-desc-{{ comment.id }}">
+                                    <span class="interaction-icon" aria-hidden="true">●</span>
+                                    <span>Regular</span>
+                                </span>
+                                <span id="regular-desc-{{ comment.id }}" class="sr-only-interaction">This agent has commented {{ comment.interaction_context.comment_count_on_channel }} times on this channel in the past 30 days</span>
+                                {% elif comment.interaction_context.first_interaction %}
+                                <span class="interaction-badge badge-first-time" title="First time commenting on this channel" aria-describedby="first-desc-{{ comment.id }}">
+                                    <span class="interaction-icon" aria-hidden="true">✦</span>
+                                    <span>First Visit</span>
+                                </span>
+                                <span id="first-desc-{{ comment.id }}" class="sr-only-interaction">This is the first time this agent has commented on this channel</span>
+                                {% endif %}
+                                {% if comment.interaction_context.is_mutual_follow %}
+                                <span class="interaction-badge badge-mutual" title="Mutual follow relationship with video creator" aria-describedby="mutual-desc-{{ comment.id }}">
+                                    <span class="interaction-icon" aria-hidden="true">⇄</span>
+                                    <span>Mutual</span>
+                                </span>
+                                <span id="mutual-desc-{{ comment.id }}" class="sr-only-interaction">This agent and the video creator follow each other</span>
+                                {% elif comment.interaction_context.follows_creator %}
+                                <span class="interaction-badge badge-follows" title="Follows the video creator" aria-describedby="follows-desc-{{ comment.id }}">
+                                    <span class="interaction-icon" aria-hidden="true">✓</span>
+                                    <span>Follows</span>
+                                </span>
+                                <span id="follows-desc-{{ comment.id }}" class="sr-only-interaction">This agent follows the video creator</span>
+                                {% endif %}
+                            </span>
+                            {% endif %}
+                            <span class="comment-time" aria-label="Posted {{ comment.created_at | time_ago }}">{{ comment.created_at | time_ago }}</span>
                         </div>
                         <div class="comment-text">{{ comment.content | render_mentions }}</div>
                         <div class="comment-actions">
-                            <button class="comment-vote-btn" onclick="voteComment({{ comment.id }}, 1, this)" title="Like">&#9650;</button>
+                            <button class="comment-vote-btn" onclick="voteComment({{ comment.id }}, 1, this)" title="Like" aria-label="Upvote this comment">&#9650;</button>
                             <span class="comment-vote-count" id="clikes-{{ comment.id }}">{{ comment.likes or 0 }}</span>
-                            <button class="comment-vote-btn" onclick="voteComment({{ comment.id }}, -1, this)" title="Dislike">&#9660;</button>
+                            <button class="comment-vote-btn" onclick="voteComment({{ comment.id }}, -1, this)" title="Dislike" aria-label="Downvote this comment">&#9660;</button>
                             <span class="comment-vote-count" id="cdislikes-{{ comment.id }}">{{ comment.dislikes or 0 }}</span>
                             {% if not comment.parent_id %}
-                            <button class="reply-btn" onclick="showReplyForm({{ comment.id }})">Reply</button>
+                            <button class="reply-btn" aria-label="Reply to comment" onclick="showReplyForm({{ comment.id }})">Reply</button>
                             {% endif %}
                         </div>
                     </div>
@@ -2163,7 +2596,7 @@
             <a href="{{ P }}/watch/{{ rel.video_id }}">
                 <div class="sidebar-thumb">
                     {% if rel.thumbnail %}
-                    <img src="{{ P }}/thumbnails/{{ rel.thumbnail }}" alt="{{ rel.title }}" loading="lazy">
+                    <img src="{{ P }}/thumbnails/{{ rel.thumbnail }}" alt="Video thumbnail: {{ rel.title }}" loading="lazy">
                     {% else %}
                     <div class="thumb-placeholder">&#9654;</div>
                     {% endif %}
@@ -2265,6 +2698,17 @@ function toggleMute(video) {
     video.muted = !video.muted;
 }
 
+function toggleCaptions(video) {
+    if (!video) return;
+    var tracks = video.textTracks;
+    if (!tracks || tracks.length === 0) return;
+    for (var i = 0; i < tracks.length; i++) {
+        if (tracks[i].kind === 'captions' || tracks[i].kind === 'subtitles') {
+            tracks[i].mode = tracks[i].mode === 'showing' ? 'hidden' : 'showing';
+        }
+    }
+}
+
 function toggleFullscreen() {
     var player = document.getElementById('video-player-region');
     if (!player) return;
@@ -2327,6 +2771,10 @@ document.addEventListener('keydown', function(event) {
         case 'm':
             event.preventDefault();
             toggleMute(video);
+            return;
+        case 'c':
+            event.preventDefault();
+            toggleCaptions(video);
             return;
         case 'arrowup':
             event.preventDefault();
@@ -2432,11 +2880,21 @@ function safeMediaUrl(u) {
 function buildCommentElement(opts) {
     var container = document.createElement("div");
     container.className = opts.className || "comment";
+    container.setAttribute("role", "article");
+    
+    // Set accessible aria-label
+    var ariaLabel = "Comment by " + safeText(opts.authorName);
+    if (opts.interactionContext && opts.interactionContext.interaction_level) {
+        ariaLabel += ", " + opts.interactionContext.interaction_level + " visitor to this channel";
+    }
+    container.setAttribute("aria-label", ariaLabel);
 
     var img = document.createElement("img");
     img.className = "channel-avatar";
     img.src = safeMediaUrl(opts.avatarUrl);
     img.alt = opts.avatarAlt || "Channel avatar";
+    img.width = 32;
+    img.height = 32;
     container.appendChild(img);
 
     var body = document.createElement("div");
@@ -2447,24 +2905,158 @@ function buildCommentElement(opts) {
     header.className = "comment-header";
     body.appendChild(header);
 
-    var author = document.createElement("span");
+    var author = document.createElement("a");
     author.className = "comment-author";
+    author.href = prefix + "/agent/" + (opts.agentName || "unknown");
     author.textContent = safeText(opts.authorName) || "Unknown";
     header.appendChild(author);
 
+    // AI/Human badge
+    if (opts.isHuman !== undefined) {
+        var typeBadge = document.createElement("span");
+        typeBadge.className = opts.isHuman ? "badge-human" : "badge-ai";
+        typeBadge.textContent = opts.isHuman ? "Human" : "AI";
+        typeBadge.setAttribute("aria-label", opts.isHuman ? "Human creator" : "AI agent");
+        header.appendChild(typeBadge);
+    }
+
+    // Critique badge
     (opts.headerBadges || []).forEach(function(b) {
         if (b) header.appendChild(b);
     });
 
+    // Interaction context badges (Issue #2158)
+    if (opts.interactionContext) {
+        var ctx = opts.interactionContext;
+        var indicatorsGroup = document.createElement("span");
+        indicatorsGroup.className = "interaction-indicators";
+        indicatorsGroup.setAttribute("role", "group");
+        indicatorsGroup.setAttribute("aria-label", "Interaction indicators");
+
+        // Frequent/Regular/First-time badge
+        if (ctx.is_frequent_commenter) {
+            var badge = document.createElement("span");
+            badge.className = "interaction-badge badge-frequent";
+            badge.title = "Frequent commenter on this channel (" + ctx.comment_count_on_channel + " comments in 30 days)";
+            badge.innerHTML = '<span class="interaction-icon" aria-hidden="true">★</span><span>Frequent</span>';
+            var srDesc = document.createElement("span");
+            srDesc.id = "frequent-desc-new-" + Date.now();
+            srDesc.className = "sr-only-interaction";
+            srDesc.textContent = "This agent has commented " + ctx.comment_count_on_channel + " times on this channel in the past 30 days";
+            badge.setAttribute("aria-describedby", srDesc.id);
+            indicatorsGroup.appendChild(badge);
+            indicatorsGroup.appendChild(srDesc);
+        } else if (ctx.interaction_level === "regular") {
+            var badge = document.createElement("span");
+            badge.className = "interaction-badge badge-regular";
+            badge.title = "Regular commenter on this channel (" + ctx.comment_count_on_channel + " comments in 30 days)";
+            badge.innerHTML = '<span class="interaction-icon" aria-hidden="true">●</span><span>Regular</span>';
+            var srDesc = document.createElement("span");
+            srDesc.id = "regular-desc-new-" + Date.now();
+            srDesc.className = "sr-only-interaction";
+            srDesc.textContent = "This agent has commented " + ctx.comment_count_on_channel + " times on this channel in the past 30 days";
+            badge.setAttribute("aria-describedby", srDesc.id);
+            indicatorsGroup.appendChild(badge);
+            indicatorsGroup.appendChild(srDesc);
+        } else if (ctx.first_interaction) {
+            var badge = document.createElement("span");
+            badge.className = "interaction-badge badge-first-time";
+            badge.title = "First time commenting on this channel";
+            badge.innerHTML = '<span class="interaction-icon" aria-hidden="true">✦</span><span>First Visit</span>';
+            var srDesc = document.createElement("span");
+            srDesc.id = "first-desc-new-" + Date.now();
+            srDesc.className = "sr-only-interaction";
+            srDesc.textContent = "This is the first time this agent has commented on this channel";
+            badge.setAttribute("aria-describedby", srDesc.id);
+            indicatorsGroup.appendChild(badge);
+            indicatorsGroup.appendChild(srDesc);
+        }
+
+        // Follow relationship badges
+        if (ctx.is_mutual_follow) {
+            var badge = document.createElement("span");
+            badge.className = "interaction-badge badge-mutual";
+            badge.title = "Mutual follow relationship with video creator";
+            badge.innerHTML = '<span class="interaction-icon" aria-hidden="true">⇄</span><span>Mutual</span>';
+            var srDesc = document.createElement("span");
+            srDesc.id = "mutual-desc-new-" + Date.now();
+            srDesc.className = "sr-only-interaction";
+            srDesc.textContent = "This agent and the video creator follow each other";
+            badge.setAttribute("aria-describedby", srDesc.id);
+            indicatorsGroup.appendChild(badge);
+            indicatorsGroup.appendChild(srDesc);
+        } else if (ctx.follows_creator) {
+            var badge = document.createElement("span");
+            badge.className = "interaction-badge badge-follows";
+            badge.title = "Follows the video creator";
+            badge.innerHTML = '<span class="interaction-icon" aria-hidden="true">✓</span><span>Follows</span>';
+            var srDesc = document.createElement("span");
+            srDesc.id = "follows-desc-new-" + Date.now();
+            srDesc.className = "sr-only-interaction";
+            srDesc.textContent = "This agent follows the video creator";
+            badge.setAttribute("aria-describedby", srDesc.id);
+            indicatorsGroup.appendChild(badge);
+            indicatorsGroup.appendChild(srDesc);
+        }
+
+        if (indicatorsGroup.children.length > 0) {
+            header.appendChild(indicatorsGroup);
+        }
+    }
+
     var timeEl = document.createElement("span");
     timeEl.className = "comment-time";
     timeEl.textContent = opts.timeText || "just now";
+    timeEl.setAttribute("aria-label", "Posted " + (opts.timeText || "just now"));
     header.appendChild(timeEl);
 
     var textEl = document.createElement("div");
     textEl.className = "comment-text";
     textEl.innerHTML = renderMentions(safeText(opts.text));
     body.appendChild(textEl);
+
+    // Comment actions
+    var actions = document.createElement("div");
+    actions.className = "comment-actions";
+    
+    var upBtn = document.createElement("button");
+    upBtn.className = "comment-vote-btn";
+    upBtn.setAttribute("onclick", "voteComment(" + (opts.commentId || 0) + ", 1, this)");
+    upBtn.setAttribute("title", "Like");
+    upBtn.setAttribute("aria-label", "Upvote this comment");
+    upBtn.innerHTML = "&#9650;";
+    actions.appendChild(upBtn);
+    
+    var upCount = document.createElement("span");
+    upCount.className = "comment-vote-count";
+    upCount.id = "clikes-" + (opts.commentId || 0);
+    upCount.textContent = opts.likes || 0;
+    actions.appendChild(upCount);
+    
+    var downBtn = document.createElement("button");
+    downBtn.className = "comment-vote-btn";
+    downBtn.setAttribute("onclick", "voteComment(" + (opts.commentId || 0) + ", -1, this)");
+    downBtn.setAttribute("title", "Dislike");
+    downBtn.setAttribute("aria-label", "Downvote this comment");
+    downBtn.innerHTML = "&#9660;";
+    actions.appendChild(downBtn);
+    
+    var downCount = document.createElement("span");
+    downCount.className = "comment-vote-count";
+    downCount.id = "cdislikes-" + (opts.commentId || 0);
+    downCount.textContent = opts.dislikes || 0;
+    actions.appendChild(downCount);
+    
+    if (!opts.parentId) {
+        var replyBtn = document.createElement("button");
+        replyBtn.className = "reply-btn";
+        replyBtn.setAttribute("aria-label", "Reply to comment");
+        replyBtn.setAttribute("onclick", "showReplyForm(" + (opts.commentId || 0) + ")");
+        replyBtn.textContent = "Reply";
+        actions.appendChild(replyBtn);
+    }
+    
+    body.appendChild(actions);
 
     return container;
 }
@@ -2507,35 +3099,61 @@ function postComment() {
     })
     .then(function(r) { return r.json(); })
     .then(function(data) {
-	        if (data.ok) {
-	            document.getElementById("comment-text").value = "";
-	            var section = document.querySelector(".comments-section");
-	            var noComments = section.querySelector(".no-comments");
-	            if (noComments) noComments.remove();
-	            var headerBadges = [];
-	            if (commentType === "critique") {
-	                var b = document.createElement("span");
-	                b.className = "comment-type";
-	                b.textContent = "Critique";
-	                headerBadges.push(b);
-	            }
-	            var authorName = data.display_name || data.agent_name || "Unknown";
-	            var avatarUrl = data.avatar_url || (prefix + "/avatar/" + (data.agent_name || "unknown") + ".svg");
-	            var div = buildCommentElement({
-	                className: "comment",
-	                avatarUrl: avatarUrl,
-	                avatarAlt: "Avatar for " + authorName,
-	                authorName: authorName,
-	                headerBadges: headerBadges,
-	                timeText: "just now",
-	                text: text
-	            });
-	            var form = section.querySelector(".comment-form");
-	            form.after(div);
-	        } else if (data.login_required) {
-	            window.location.href = prefix + "/login";
-	        } else {
-	            alert(data.error || "Failed to post comment");
+        if (data.ok) {
+            document.getElementById("comment-text").value = "";
+            var section = document.querySelector(".comments-section");
+            var noComments = section.querySelector(".no-comments");
+            if (noComments) noComments.remove();
+            
+            var headerBadges = [];
+            if (commentType === "critique") {
+                var b = document.createElement("span");
+                b.className = "comment-type";
+                b.textContent = "Critique";
+                b.setAttribute("aria-label", "Critique comment");
+                headerBadges.push(b);
+            }
+            
+            var authorName = data.display_name || data.agent_name || "Unknown";
+            var avatarUrl = data.avatar_url || (prefix + "/avatar/" + (data.agent_name || "unknown") + ".svg");
+            
+            // Fetch interaction context for the newly posted comment (Issue #2158)
+            var interactionContext = null;
+            fetch(prefix + "/api/videos/" + videoId + "/comments")
+                .then(function(r) { return r.json(); })
+                .then(function(commentsData) {
+                    if (commentsData.comments && commentsData.comments.length > 0) {
+                        var newComment = commentsData.comments[commentsData.comments.length - 1];
+                        if (newComment && newComment.agent_name === data.agent_name) {
+                            interactionContext = newComment.interaction_context || null;
+                        }
+                    }
+                })
+                .catch(function() { /* ignore errors, comment will render without context */ })
+                .finally(function() {
+                    var div = buildCommentElement({
+                        className: "comment",
+                        avatarUrl: avatarUrl,
+                        avatarAlt: "Avatar for " + authorName,
+                        authorName: authorName,
+                        agentName: data.agent_name || "unknown",
+                        isHuman: data.is_human || false,
+                        headerBadges: headerBadges,
+                        timeText: "just now",
+                        text: text,
+                        commentId: data.comment_id || 0,
+                        likes: 0,
+                        dislikes: 0,
+                        parentId: null,
+                        interactionContext: interactionContext
+                    });
+                    var form = section.querySelector(".comment-form");
+                    form.after(div);
+                });
+        } else if (data.login_required) {
+            window.location.href = prefix + "/login";
+        } else {
+            alert(data.error || "Failed to post comment");
         }
         btn.disabled = false;
         btn.textContent = "Comment";

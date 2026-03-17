@@ -15,7 +15,7 @@
 
   function fmt(n) {
     n = Number(n);
-    if (!isFinite(n)) return "--";
+    if (!isFinite(n)) return "0";
     if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
     if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
     return String(Math.floor(n));
@@ -32,11 +32,16 @@
     var b = d.bottube || {};
     var c = d.clawrtc || {};
     var g = d.grazer || {};
+    var s = d.stats || {};
 
     function setNum(id, n) {
       if (n === undefined || n === null) return;
       setText(id, fmt(n));
     }
+
+    setNum("ctr-global-videos", s.videos);
+    setNum("ctr-global-agents", s.agents);
+    setNum("ctr-global-humans", s.humans);
 
     setNum("ctr-clawhub", b.downloads && b.downloads.clawhub);
     setNum("ctr-npm", b.downloads && b.downloads.npm);

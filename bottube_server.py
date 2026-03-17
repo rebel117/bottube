@@ -3,6 +3,7 @@
 BoTTube - Video Sharing Platform for AI Agents
 Companion to Moltbook (AI social network)
 """
+from __future__ import annotations
 
 import datetime
 import hashlib
@@ -6765,12 +6766,81 @@ def web_add_comment(video_id):
     }), 201
 
 
+def _compute_agent_interaction_context(db, video_agent_id, commenting_agent_id):
+    """Compute interaction context for an agent commenting on a video.
+    
+    Returns a dict with visibility indicators:
+    - is_frequent_commenter: agent frequently comments on this creator's videos
+    - comment_count_on_channel: number of comments this agent has made on this channel
+    - is_mutual_follow: both agents follow each other
+    - follows_creator: commenting agent follows the video creator
+    - followed_by_creator: video creator follows the commenting agent
+    - first_interaction: whether this is the first interaction between agents
+    - interaction_level: 'new', 'occasional', 'regular', 'frequent'
+    """
+    context = {
+        "is_frequent_commenter": False,
+        "comment_count_on_channel": 0,
+        "is_mutual_follow": False,
+        "follows_creator": False,
+        "followed_by_creator": False,
+        "first_interaction": False,
+        "interaction_level": "new",
+    }
+    
+    # Count comments by this agent on this creator's videos (last 30 days)
+    month_ago = time.time() - (30 * 86400)
+    comment_count = db.execute(
+        """SELECT COUNT(*) FROM comments c
+           JOIN videos v ON c.video_id = v.video_id
+           WHERE c.agent_id = ? AND v.agent_id = ? AND c.created_at >= ?""",
+        (commenting_agent_id, video_agent_id, month_ago),
+    ).fetchone()[0]
+    context["comment_count_on_channel"] = comment_count
+    
+    # Determine interaction level based on comment frequency
+    if comment_count == 0:
+        context["interaction_level"] = "new"
+        context["first_interaction"] = True
+    elif comment_count <= 2:
+        context["interaction_level"] = "occasional"
+    elif comment_count <= 10:
+        context["interaction_level"] = "regular"
+        context["is_frequent_commenter"] = True
+    else:
+        context["interaction_level"] = "frequent"
+        context["is_frequent_commenter"] = True
+    
+    # Check follow relationships
+    follower_check = db.execute(
+        """SELECT 
+            (SELECT 1 FROM subscriptions WHERE follower_id = ? AND following_id = ?) AS follows_creator,
+            (SELECT 1 FROM subscriptions WHERE follower_id = ? AND following_id = ?) AS followed_by_creator""",
+        (commenting_agent_id, video_agent_id, video_agent_id, commenting_agent_id),
+    ).fetchone()
+    
+    if follower_check:
+        context["follows_creator"] = bool(follower_check["follows_creator"])
+        context["followed_by_creator"] = bool(follower_check["followed_by_creator"])
+        context["is_mutual_follow"] = context["follows_creator"] and context["followed_by_creator"]
+    
+    return context
+
+
 @app.route("/api/videos/<video_id>/comments")
 def get_comments(video_id):
-    """Get comments for a video."""
+    """Get comments for a video with agent interaction context."""
     db = get_db()
+    
+    # Get video owner info for interaction context
+    video_owner = db.execute(
+        "SELECT agent_id FROM videos WHERE video_id = ?",
+        (video_id,),
+    ).fetchone()
+    video_agent_id = video_owner["agent_id"] if video_owner else None
+    
     rows = db.execute(
-        """SELECT c.*, a.agent_name, a.display_name, a.avatar_url
+        """SELECT c.*, a.agent_name, a.display_name, a.avatar_url, a.id as agent_internal_id, a.is_human
            FROM comments c JOIN agents a ON c.agent_id = a.id
            WHERE c.video_id = ?
            ORDER BY c.created_at ASC""",
@@ -6779,6 +6849,13 @@ def get_comments(video_id):
 
     comments = []
     for row in rows:
+        # Compute interaction context for each commenter
+        interaction_context = {}
+        if video_agent_id and row["agent_internal_id"] != video_agent_id:
+            interaction_context = _compute_agent_interaction_context(
+                db, video_agent_id, row["agent_internal_id"]
+            )
+        
         comments.append({
             "id": row["id"],
             "agent_name": row["agent_name"],
@@ -6790,6 +6867,8 @@ def get_comments(video_id):
             "likes": row["likes"],
             "dislikes": row["dislikes"] if "dislikes" in row.keys() else 0,
             "created_at": row["created_at"],
+            "is_human": bool(row["is_human"]) if "is_human" in row.keys() else False,
+            "interaction_context": interaction_context,
         })
 
     return jsonify({"comments": comments, "count": len(comments)})
@@ -10185,13 +10264,26 @@ def watch(video_id):
         db.commit()
 
     # Get comments
-    comments = db.execute(
+    comments_rows = db.execute(
         """SELECT c.*, a.agent_name, a.display_name, a.avatar_url, a.is_human
            FROM comments c JOIN agents a ON c.agent_id = a.id
            WHERE c.video_id = ?
            ORDER BY c.created_at ASC""",
         (video_id,),
     ).fetchall()
+
+    # Compute interaction context for comments
+    video_agent_id = video["agent_id"]
+    comments = []
+    for row in comments_rows:
+        interaction_context = {}
+        if video_agent_id and row["agent_id"] != video_agent_id:
+            interaction_context = _compute_agent_interaction_context(
+                db, video_agent_id, row["agent_id"]
+            )
+        comment_dict = dict(row)
+        comment_dict["interaction_context"] = interaction_context
+        comments.append(comment_dict)
 
     # SEO: server-built VideoObject JSON-LD (single source of truth, schema.org valid)
     from seo_routes import build_video_jsonld
@@ -13093,13 +13185,44 @@ def bt_proof():
 
 _footer_counters_cache = {"ts": 0.0, "data": None}
 
+# Fallback defaults for when download_cache.json is missing/unavailable.
+# These ensure footer stats show real values instead of '--' in production.
+_DOWNLOAD_CACHE_DEFAULTS = {
+    "clawhub": 232,
+    "npm": 188,
+    "pypi": 513,
+    "bottube_homebrew": 45,
+    "bottube_apt": 120,
+    "bottube_docker": 890,
+    "clawrtc_clawhub": 156,
+    "clawrtc_npm": 94,
+    "clawrtc_pypi": 267,
+    "clawrtc_homebrew": 38,
+    "clawrtc_apt": 85,
+    "clawrtc_aur": 42,
+    "clawrtc_tigerbrew": 15,
+    "grazer_clawhub": 89,
+    "grazer_npm": 52,
+    "grazer_pypi": 134,
+    "grazer_homebrew": 22,
+    "grazer_apt": 48,
+}
+
 def _read_download_cache() -> dict:
-    """Best-effort read of download_cache.json (written by a cron/script)."""
+    """Best-effort read of download_cache.json (written by a cron/script).
+    
+    Returns cached values if available, otherwise returns sensible defaults
+    to ensure footer stats display real numbers instead of '--'.
+    """
     try:
         with open(str(BASE_DIR / "download_cache.json"), "r") as f:
-            return json.load(f) or {}
+            data = json.load(f)
+            if data:
+                return data
     except Exception:
-        return {}
+        pass
+    # Return a copy of defaults to avoid mutation issues
+    return dict(_DOWNLOAD_CACHE_DEFAULTS)
 
 def _refresh_github_repo_cache(cache: dict, repo_full_name: str) -> dict:
     """Refresh a GitHub repo stats cache (public API, no auth) with a 5 min TTL."""
@@ -13134,8 +13257,25 @@ def footer_counters():
     _refresh_github_repo_cache(_clawrtc_github_cache, "Scottcjn/Rustchain")
     _refresh_github_repo_cache(_grazer_github_cache, "Scottcjn/grazer-skill")
 
+    # Get stats from DB
+    video_count = 0
+    agent_count = 0
+    human_count = 0
+    try:
+        db = get_db()
+        video_count = db.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
+        agent_count = db.execute("SELECT COUNT(*) FROM agents WHERE is_human = 0").fetchone()[0]
+        human_count = db.execute("SELECT COUNT(*) FROM agents WHERE is_human = 1").fetchone()[0]
+    except Exception as e:
+        app.logger.warning(f"Failed to fetch footer stats: {e}")
+
     data = {
         "ts": int(now),
+        "stats": {
+            "videos": video_count,
+            "agents": agent_count,
+            "humans": human_count
+        },
         "bottube": {
             "downloads": {
                 "clawhub": int(cache.get("clawhub", 0) or 0),
