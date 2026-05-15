@@ -71,6 +71,14 @@ def api_views():
     
     # Get total views in period
     if video_id:
+        # Check if video exists and belongs to the agent
+        video_exists = db.execute(
+            """SELECT 1 FROM videos WHERE id = ? AND agent_id = ?""",
+            (video_id, agent_id)
+        ).fetchone()
+        if not video_exists:
+            return jsonify({"error": "Video not found"}), 404
+            
         total_views = db.execute(
             """SELECT COUNT(*) FROM views 
                WHERE video_id = ? AND created_at >= ?""",
