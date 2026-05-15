@@ -16314,7 +16314,7 @@ def video_ctr_stats(video_id):
     v = db.execute("SELECT 1 FROM videos WHERE id = ?", (video_id,)).fetchone()
     if not v:
         return jsonify({"error": "Video not found"}), 404
-    
+
     try:
         stats = _get_ctr_tracker().get_stats(video_id)
         if not stats:
@@ -16346,7 +16346,7 @@ def video_ab_variants(video_id):
     v = db.execute("SELECT 1 FROM videos WHERE id = ?", (video_id,)).fetchone()
     if not v:
         return jsonify({"error": "Video not found"}), 404
-    
+
     try:
         stats = _get_ab_manager().get_variant_stats(video_id)
         winner = _get_ab_manager().get_winner(video_id)
