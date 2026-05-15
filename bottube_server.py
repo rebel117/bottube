@@ -20808,7 +20808,7 @@ def admin_provenance_reap_confirmations():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     _provenance_ensure_anchor_columns()
 
-    ergo_base = os.environ.get("ERGO_BASE", "http://localhost:19053")
+    ergo_base = os.environ.get("ERGO_BASE", "http://localhost:9053")
     ergo_key = os.environ.get("ERGO_API_KEY", "")
     if not ergo_key:
         return jsonify({"ok": False, "error": "ERGO_API_KEY not set"}), 503
@@ -20972,7 +20972,7 @@ def admin_reconcile_anchors():
     if strategy not in ("random", "recent", "oldest"):
         strategy = "random"
 
-    ergo_base = os.environ.get("ERGO_BASE", "http://localhost:19053")
+    ergo_base = os.environ.get("ERGO_BASE", "http://localhost:9053")
     ergo_key = os.environ.get("ERGO_API_KEY", "")
     if not ergo_key:
         return jsonify({"ok": False, "error": "ERGO_API_KEY not set"}), 503
@@ -21655,7 +21655,7 @@ def anchor_chain_proxy(tx_hash):
     """
     if not re.fullmatch(r"[0-9a-fA-F]{32,128}", tx_hash):
         return jsonify({"ok": False, "error": "invalid tx_hash"}), 400
-    ergo_base = os.environ.get("ERGO_BASE", "http://localhost:19053")
+    ergo_base = os.environ.get("ERGO_BASE", "http://localhost:9053")
     ergo_key = os.environ.get("ERGO_API_KEY", "")
     try:
         req = urllib.request.Request(
