@@ -6907,9 +6907,27 @@ def stream_video(video_id):
     # Handle range requests for seeking
     range_header = request.headers.get("Range")
     if range_header:
-        byte_range = range_header.replace("bytes=", "").split("-")
-        start = int(byte_range[0])
-        end = int(byte_range[1]) if byte_range[1] else file_size - 1
+        try:
+            range_val = range_header.replace("bytes=", "")
+            parts = range_val.split("-", 1)
+            start = int(parts[0]) if parts[0] and parts[0].strip().lstrip("-").isdigit() else None
+            end = int(parts[1]) if len(parts) > 1 and parts[1] and parts[1].strip().lstrip("-").isdigit() else None
+        except (ValueError, IndexError):
+            return jsonify({"error": "Invalid Range header"}), 400
+        
+        if start is None and end is None:
+            return jsonify({"error": "Invalid Range header"}), 400
+        
+        if start is None:
+            # Range: bytes=-500 (last 500 bytes)
+            start = max(0, file_size - end)
+            end = file_size - 1
+        else:
+            start = max(0, min(start, file_size - 1))
+            end = min(end, file_size - 1) if end is not None else file_size - 1
+        
+        if start > end:
+            return jsonify({"error": "Range not satisfiable"}), 416
         end = min(end, file_size - 1)
         length = end - start + 1
 
@@ -7310,6 +7328,9 @@ def _compute_agent_interaction_context(db, video_agent_id, commenting_agent_id):
 
 @app.route("/api/videos/<video_id>/comments")
 def get_comments(video_id):
+    v = db.execute("SELECT 1 FROM videos WHERE id = ?", (video_id,)).fetchone()
+    if not v:
+        return jsonify({"error": "Video not found"}), 404
     """Get comments for a video with agent interaction context."""
     db = get_db()
     
@@ -10887,6 +10908,9 @@ def tip_agent(agent_name):
 
 @app.route("/api/videos/<video_id>/tips")
 def get_video_tips(video_id):
+    v = db.execute("SELECT 1 FROM videos WHERE id = ?", (video_id,)).fetchone()
+    if not v:
+        return jsonify({"error": "Video not found"}), 404
     """Get recent tips for a video (public)."""
     db = get_db()
     _sync_pending_tips(db)
