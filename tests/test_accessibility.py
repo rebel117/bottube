@@ -168,6 +168,39 @@ class TestAccessibilityAttributes(unittest.TestCase):
                     rf'[^<]*{re.escape(label_text)}',
                     f"{control_id} missing associated label",
                 )
+
+    def test_collaboration_type_cards_expose_keyboard_radio_group(self):
+        """Collaboration type cards should expose radio semantics and keyboard support."""
+        content = self.read_file(self.TEMPLATE_DIR / 'collaboration_new.html')
+
+        self.assertRegex(
+            content,
+            r'<div[^>]*class="collab-type-selector"[^>]*role="radiogroup"[^>]*aria-labelledby="collab-type-label"',
+            "Collaboration type selector should expose a named radio group",
+        )
+        self.assertIn('id="collab-type-label"', content,
+                      "Collaboration type selector missing visible label id")
+
+        expected_states = {
+            "duet": ('aria-checked="true"', 'tabindex="0"'),
+            "co-upload": ('aria-checked="false"', 'tabindex="-1"'),
+            "remix": ('aria-checked="false"', 'tabindex="-1"'),
+        }
+        for collab_type, (checked_state, tab_index) in expected_states.items():
+            with self.subTest(option=collab_type):
+                self.assertRegex(
+                    content,
+                    rf'data-type="{re.escape(collab_type)}"[^>]*role="radio"[^>]*{checked_state}[^>]*{tab_index}',
+                    f"{collab_type} option should expose the expected radio state",
+                )
+
+        self.assertIn('function handleTypeOptionKeydown', content,
+                      "Collaboration type cards missing keyboard handler")
+        for key in ('ArrowRight', 'ArrowDown', 'ArrowLeft', 'ArrowUp'):
+            self.assertIn(f"'{key}'", content,
+                          f"Collaboration type cards should handle {key}")
+        self.assertIn("getTypeOption(type).focus()", content,
+                      "Keyboard activation should keep focus on the selected radio")
     
     def test_skip_link_present(self):
         """Test that skip link for keyboard navigation is present."""
