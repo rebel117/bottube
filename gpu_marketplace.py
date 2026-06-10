@@ -193,11 +193,46 @@ def transfer_rtc(from_id: int, to_id: int, amount: float, memo: str = "") -> boo
     except Exception:
         return False
 
+
+def require_gpu_api_key(f):
+    """Require an agent API key and expose the agent on flask.g."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        api_key = request.headers.get("X-API-Key", "")
+        if not api_key:
+            return jsonify({"error": "Missing X-API-Key header"}), 401
+
+        db = get_db()
+        agent = db.execute(
+            "SELECT * FROM agents WHERE api_key = ?", (api_key,)
+        ).fetchone()
+        if not agent:
+            return jsonify({"error": "Invalid API key"}), 401
+
+        try:
+            if agent["is_banned"]:
+                return jsonify({
+                    "error": "Account banned",
+                    "reason": agent["ban_reason"] or "",
+                }), 403
+        except (IndexError, KeyError):
+            pass
+
+        db.execute(
+            "UPDATE agents SET last_active = ? WHERE id = ?",
+            (time.time(), agent["id"]),
+        )
+        db.commit()
+        g.agent = agent
+        return f(*args, **kwargs)
+    return decorated
+
 # ---------------------------------------------------------------------------
 # PROVIDER ENDPOINTS
 # ---------------------------------------------------------------------------
 
 @gpu_bp.route('/providers/register', methods=['POST'])
+@require_gpu_api_key
 def register_provider():
     """Register as a GPU provider.
 
@@ -241,6 +276,7 @@ def register_provider():
 
 
 @gpu_bp.route('/providers/heartbeat', methods=['POST'])
+@require_gpu_api_key
 def provider_heartbeat():
     """Send heartbeat to stay online and receive jobs.
 
@@ -330,6 +366,7 @@ def list_providers():
 
 
 @gpu_bp.route('/providers/stats', methods=['GET'])
+@require_gpu_api_key
 def provider_stats():
     """Get stats for the authenticated provider."""
     agent = g.agent
@@ -359,6 +396,7 @@ def provider_stats():
 # ---------------------------------------------------------------------------
 
 @gpu_bp.route('/jobs/submit', methods=['POST'])
+@require_gpu_api_key
 def submit_job():
     """Submit a GPU rendering job.
 
@@ -410,6 +448,7 @@ def submit_job():
 
 
 @gpu_bp.route('/jobs/claim', methods=['POST'])
+@require_gpu_api_key
 def claim_job():
     """Claim a pending job as a GPU provider.
 
@@ -468,6 +507,7 @@ def claim_job():
 
 
 @gpu_bp.route('/jobs/start', methods=['POST'])
+@require_gpu_api_key
 def start_job():
     """Mark a claimed job as started (running).
 
@@ -507,6 +547,7 @@ def start_job():
 
 
 @gpu_bp.route('/jobs/complete', methods=['POST'])
+@require_gpu_api_key
 def complete_job():
     """Mark a job as completed and receive payment.
 
@@ -582,6 +623,7 @@ def complete_job():
 
 
 @gpu_bp.route('/jobs/fail', methods=['POST'])
+@require_gpu_api_key
 def fail_job():
     """Mark a job as failed.
 
@@ -659,6 +701,7 @@ def get_job_status(job_id):
 
 
 @gpu_bp.route('/jobs/list', methods=['GET'])
+@require_gpu_api_key
 def list_jobs():
     """List jobs (filtered by status or requester)."""
     agent = g.agent
