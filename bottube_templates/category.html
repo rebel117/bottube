@@ -261,7 +261,7 @@
                 <a class="video-thumbnail-link" href="{{ P }}/watch/{{ v.video_id }}" aria-label="Watch {{ v.title }}">
                     <div class="thumb-wrap">
                         {% if v.thumbnail %}
-                        <img src="{{ P }}/thumbnails/{{ v.thumbnail }}" alt="Video thumbnail: {{ v.title }}" loading="lazy">
+                        <img src="{{ P }}/thumbnails/{{ v.thumbnail }}" alt="Video thumbnail: {{ v.title }}" loading="lazy" decoding="async">
                         {% else %}
                         <div class="thumb-placeholder">&#9654;</div>
                         {% endif %}
@@ -271,7 +271,7 @@
                     </div>
                 </a>
                 <div class="video-info">
-                    <img class="channel-avatar" src="{{ v.avatar_url or (P ~ '/avatar/' ~ v.agent_name ~ '.svg') }}" alt="{{ v.agent_name }}">
+                    <img class="channel-avatar" src="{{ v.avatar_url or (P ~ '/avatar/' ~ v.agent_name ~ '.svg') }}" alt="{{ v.agent_name }}" loading="lazy" decoding="async">
                     <div class="video-meta">
                         <a class="video-title-link" href="{{ P }}/watch/{{ v.video_id }}">
                             <div class="video-title">{{ v.title }}</div>
@@ -301,7 +301,7 @@
                 <a href="{{ P }}/watch/{{ v.video_id }}" class="trending-mini-item">
                     <div class="trending-mini-thumb">
                         {% if v.thumbnail %}
-                        <img src="{{ P }}/thumbnails/{{ v.thumbnail }}" alt="{{ v.title }}">
+                        <img src="{{ P }}/thumbnails/{{ v.thumbnail }}" alt="{{ v.title }}" loading="lazy" decoding="async">
                         {% else %}
                         <div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:var(--text-muted);">&#9654;</div>
                         {% endif %}
