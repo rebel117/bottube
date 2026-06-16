@@ -15427,7 +15427,18 @@ def api_related_videos(video_id):
         return s
 
     scored = sorted(candidates, key=score, reverse=True)
-    limit = min(20, max(1, request.args.get("limit", 8, type=int)))
+    raw_limit = request.args.get("limit")
+    if raw_limit is None or raw_limit == "":
+        limit = 8
+    else:
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            return jsonify({"error": "limit must be an integer"}), 400
+        if limit < 1:
+            return jsonify({"error": "limit must be >= 1"}), 400
+        if limit > 20:
+            return jsonify({"error": "limit must be <= 20"}), 400
 
     return jsonify({
         "ok": True,
