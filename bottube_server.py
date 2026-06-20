@@ -1442,7 +1442,7 @@ def set_url_prefix():
     host = request.host.split(":")[0].lower()
     canonical_host = os.getenv("BOTTUBE_CANONICAL_HOST", "bottube.ai").strip().lower()
     if os.getenv("BOTTUBE_WWW_REDIRECT", "1").strip().lower() not in {"0", "false", "no"}:
-        if host == f"www.{canonical_host}":
+        if host == f"www.{canonical_host}" and request.path != "/validation-key.txt":
             scheme = (
                 "https"
                 if (request.is_secure or request.headers.get("X-Forwarded-Proto") == "https")
@@ -1505,7 +1505,12 @@ def set_security_headers(response):
     # Embed route allows framing from any origin; all other routes restrict it
     is_embed = request.path.startswith("/embed/")
     if not is_embed and not is_api:
-        response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+        # Pi Network: bottube.ai must be embeddable by Pi Browser / Pi App Studio, so
+        # framing is governed by CSP frame-ancestors (below), NOT X-Frame-Options
+        # (which has no allow-list and would block Pi). Pi App Studio's preview is
+        # cross-origin isolated, so it also needs CORP + COEP to load bottube.ai.
+        response.headers.setdefault("Cross-Origin-Resource-Policy", "cross-origin")
+        response.headers.setdefault("Cross-Origin-Embedder-Policy", "credentialless")
         # NOTE: 'unsafe-inline' is required for script-src and style-src because
         # legacy templates use inline <script> blocks (JSON-LD, GA gtag) and
         # inline <style> blocks throughout.  Migrating to nonce-based CSP
@@ -1513,16 +1518,17 @@ def set_security_headers(response):
         # mitigated by safe_jsonld() / jsonld_safe which escape </ sequences.
         csp = (
             "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline' https://www.googletagmanager.com https://www.google-analytics.com https://stats.g.doubleclick.net https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://unpkg.com https://www.gstatic.com https://imasdk.googleapis.com; "
+            "script-src 'self' 'unsafe-inline' https://www.googletagmanager.com https://www.google-analytics.com https://stats.g.doubleclick.net https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://unpkg.com https://www.gstatic.com https://imasdk.googleapis.com https://sdk.minepi.com; "
             "style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data: https:; "
             "media-src 'self'; "
             "font-src 'self'; "
-            "connect-src 'self' https://www.google-analytics.com https://region1.google-analytics.com https://stats.g.doubleclick.net https://www.googletagmanager.com https://www.google.com; "
+            "connect-src 'self' https://www.google-analytics.com https://region1.google-analytics.com https://stats.g.doubleclick.net https://www.googletagmanager.com https://www.google.com https://api.minepi.com https://sdk.minepi.com https://*.minepi.com; "
             "object-src 'none'; "
             "base-uri 'self'; "
             "form-action 'self'; "
-            "frame-ancestors 'self'"
+            "frame-src 'self' https://*.minepi.com; "
+            "frame-ancestors 'self' https://*.minepi.com https://*.pi https://*.pinet.com"
         )
         response.headers.setdefault("Content-Security-Policy", csp)
     return response
@@ -2391,10 +2397,20 @@ def init_db():
         "google_id": "ALTER TABLE agents ADD COLUMN google_id TEXT DEFAULT ''",
         "google_email": "ALTER TABLE agents ADD COLUMN google_email TEXT DEFAULT ''",
         "google_avatar": "ALTER TABLE agents ADD COLUMN google_avatar TEXT DEFAULT ''",
+        # Pi Network login: maps a Pi uid to a BoTTube agents account
+        "pi_uid": "ALTER TABLE agents ADD COLUMN pi_uid TEXT DEFAULT ''",
     }
     for col, sql in google_migrations.items():
         if col not in existing_cols:
             conn.execute(sql)
+    # Pi Network: one BoTTube account per Pi uid (empty uid allowed for every non-Pi account).
+    # Defensive: a hand-edited DB with duplicate pi_uid must not block startup.
+    try:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_pi_uid ON agents(pi_uid) WHERE pi_uid != ''"
+        )
+    except sqlite3.IntegrityError as e:
+        print(f"[WARN] could not create idx_agents_pi_uid (duplicate pi_uid?): {e}")
 
     # Migration: add is_removed to videos if missing
     video_cols = {row[1] for row in conn.execute("PRAGMA table_info(videos)").fetchall()}
@@ -5082,6 +5098,110 @@ def signup():
     session["user_id"] = user["id"]
 
     return redirect(url_for("index"))
+
+
+@app.route("/validation-key.txt")
+def pi_validation_key():
+    """Serve the Pi Network app validation key (proves bottube.ai ownership to the Pi
+    Developer Portal). The key is read from validation_key.txt at request time, so
+    pasting a new key into that file takes effect with no restart. Pi fetches this at
+    https://www.bottube.ai/validation-key.txt and does NOT follow redirects, so the
+    www->apex redirect in set_url_prefix() is exempted for this exact path."""
+    from flask import Response
+    try:
+        with open(os.path.join(str(BASE_DIR), "validation_key.txt")) as fp:
+            key = fp.read().strip()
+    except OSError:
+        key = ""
+    return Response(key, mimetype="text/plain")
+
+
+@app.route("/pi/auth", methods=["POST"])
+def pi_auth():
+    """Pi Network login. Validate the Pi access token SERVER-SIDE via /v2/me, then
+    find-or-create a BoTTube agents account keyed on pi_uid and establish a session.
+    No Pi API key is required for this flow (mirrors /auth/google). Username scope
+    only -- this never initiates a Pi payment."""
+    data = request.get_json(silent=True) or {}
+    access_token = (data.get("access_token") or "").strip()
+    if not access_token:
+        return jsonify({"error": "access_token required"}), 400
+    try:
+        req = urllib.request.Request(
+            "https://api.minepi.com/v2/me",
+            headers={"Authorization": "Bearer " + access_token},
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            me = json.loads(r.read())
+    except Exception as e:
+        code = getattr(e, "code", None)
+        if code in (400, 401, 403):
+            return jsonify({"error": "invalid or expired Pi access token"}), 401
+        return jsonify({"error": "could not reach Pi auth service"}), 502
+    user = me.get("user", me) if isinstance(me, dict) else {}
+    pi_uid = (user or {}).get("uid")
+    pi_username = (user or {}).get("username") or ""
+    if not pi_uid:
+        return jsonify({"error": "unexpected /me response"}), 502
+
+    db = get_db()
+    # Case 1: existing Pi user -> log in
+    existing = db.execute("SELECT * FROM agents WHERE pi_uid = ?", (pi_uid,)).fetchone()
+    if existing:
+        db.execute("UPDATE agents SET last_active = ? WHERE id = ?", (time.time(), existing["id"]))
+        db.commit()
+        session.clear()
+        session.permanent = True
+        session["user_id"] = existing["id"]
+        session["csrf_token"] = secrets.token_hex(32)
+        return jsonify({"ok": True, "username": existing["agent_name"], "linked": True})
+    # Case 2: currently logged in -> link Pi to this account (guard against double-link)
+    if g.user:
+        current = (g.user["pi_uid"] if "pi_uid" in g.user.keys() else "") or ""
+        if current and current != pi_uid:
+            return jsonify({"error": "This BoTTube account is already linked to a different Pi account"}), 409
+        other = db.execute(
+            "SELECT id FROM agents WHERE pi_uid = ? AND id != ?", (pi_uid, g.user["id"])
+        ).fetchone()
+        if other:
+            return jsonify({"error": "This Pi account is already linked to another BoTTube account"}), 409
+        db.execute("UPDATE agents SET pi_uid = ? WHERE id = ?", (pi_uid, g.user["id"]))
+        db.commit()
+        return jsonify({"ok": True, "username": g.user["agent_name"], "linked": True})
+    # Case 3: new user -> auto-create account
+    base_name = re.sub(r"[^a-z0-9_-]", "", (pi_username or "pi_user").lower())[:24] or "pi_user"
+    username = base_name
+    suffix = 1
+    while db.execute("SELECT 1 FROM agents WHERE agent_name = ?", (username,)).fetchone():
+        username = base_name + str(suffix)
+        suffix += 1
+    api_key = gen_api_key()
+    now = time.time()
+    try:
+        cur = db.execute(
+            "INSERT INTO agents (agent_name, display_name, api_key, is_human, pi_uid, avatar_url, created_at, last_active) "
+            "VALUES (?, ?, ?, 1, ?, '', ?, ?)",
+            (username, pi_username or username, api_key, pi_uid, now, now),
+        )
+        db.commit()
+    except sqlite3.IntegrityError:
+        # Concurrent first-time login for the same pi_uid lost the create race -> log in instead of 500.
+        db.rollback()
+        existing = db.execute("SELECT * FROM agents WHERE pi_uid = ?", (pi_uid,)).fetchone()
+        if not existing:
+            raise
+        db.execute("UPDATE agents SET last_active = ? WHERE id = ?", (time.time(), existing["id"]))
+        db.commit()
+        session.clear()
+        session.permanent = True
+        session["user_id"] = existing["id"]
+        session["csrf_token"] = secrets.token_hex(32)
+        return jsonify({"ok": True, "username": existing["agent_name"], "linked": True})
+    session.clear()
+    session.permanent = True
+    session["user_id"] = cur.lastrowid
+    session["csrf_token"] = secrets.token_hex(32)
+    return jsonify({"ok": True, "username": username, "created": True})
 
 
 @app.route("/logout", methods=["GET", "POST"])
