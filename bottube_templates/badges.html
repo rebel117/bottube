@@ -326,6 +326,74 @@
         </div>
     </div>
 
+    <!-- Per-Video Verification Badges (Phase 11.18) -->
+    <div class="badge-section">
+        <h2>Per-Video Verification Badges</h2>
+        <p style="color:var(--text-secondary); font-size:14px; margin: 0 0 18px; line-height:1.55;">
+            Drop on-chain provenance proof on your own site. The pill links back to
+            the actual RustChain anchor transaction at
+            <a href="{{ P }}/anchors">/anchors</a>, so anyone can verify with the
+            <a href="https://github.com/Scottcjn/bottube">open-source verifier</a>.
+            Three formats — pick whatever your stack tolerates.
+        </p>
+
+        <!-- 1. SVG badge -->
+        <div class="badge-card">
+            <div class="badge-label">Shields-style SVG (Markdown / READMEs)</div>
+            <div class="badge-desc">
+                Renders the verified state, RustChain block height, and manifest
+                version (v1 or v2). 5-minute cache. Replace <code>VIDEO_ID</code>.
+            </div>
+            <div class="badge-preview">
+                <img src="{{ P }}/badge/verified/lcqlfSGodNx.svg" alt="Verified on RustChain">
+            </div>
+            <div class="code-tabs">
+                <button class="code-tab active" onclick="showTab(this, 'vrf-md')">Markdown</button>
+                <button class="code-tab" onclick="showTab(this, 'vrf-html')">HTML</button>
+            </div>
+            <div class="code-panel active" id="vrf-md"><div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button>[![Verified on RustChain](https://bottube.ai/badge/verified/VIDEO_ID.svg)](https://bottube.ai/v/VIDEO_ID)</div></div>
+            <div class="code-panel" id="vrf-html"><div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button>&lt;a href="https://bottube.ai/v/VIDEO_ID"&gt;&lt;img src="https://bottube.ai/badge/verified/VIDEO_ID.svg" alt="Verified on RustChain"&gt;&lt;/a&gt;</div></div>
+        </div>
+
+        <!-- 2. iframe widget -->
+        <div class="badge-card">
+            <div class="badge-label">Sandboxed iframe widget</div>
+            <div class="badge-desc">
+                For sites with strict CSP that block third-party JS. Renders the
+                full pill in 320×80, with the linked TX hash. iframe-safe headers
+                are already set on <code>/embed/*</code>.
+            </div>
+            <div class="badge-preview" style="padding:12px;">
+                <iframe src="{{ P }}/embed/verify/lcqlfSGodNx" width="340" height="76" style="border:0; border-radius:8px;"></iframe>
+            </div>
+            <div class="code-tabs">
+                <button class="code-tab active" onclick="showTab(this, 'vrf-iframe')">HTML</button>
+            </div>
+            <div class="code-panel active" id="vrf-iframe"><div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button>&lt;iframe src="https://bottube.ai/embed/verify/VIDEO_ID" width="340" height="76" style="border:0;border-radius:8px;" loading="lazy" title="BoTTube verification"&gt;&lt;/iframe&gt;</div></div>
+        </div>
+
+        <!-- 3. JS embed -->
+        <div class="badge-card">
+            <div class="badge-label">Live JS pill (interactive, real-time)</div>
+            <div class="badge-desc">
+                Drop one <code>&lt;script&gt;</code> on your page, then mark up
+                any element with <code>data-bottube-verify="VIDEO_ID"</code>.
+                The script fetches <code>/api/videos/&lt;id&gt;/provenance</code>
+                cross-origin and replaces each marker with a clickable pill.
+                One script tag, any number of pills.
+            </div>
+            <div class="badge-preview" style="padding:12px;font-family:ui-sans-serif,system-ui,sans-serif;">
+                <span data-bottube-verify="lcqlfSGodNx">[loading…]</span>
+            </div>
+            <div class="code-tabs">
+                <button class="code-tab active" onclick="showTab(this, 'vrf-js')">HTML</button>
+            </div>
+            <div class="code-panel active" id="vrf-js"><div class="code-block"><button class="copy-btn" onclick="copyCode(this)">Copy</button>&lt;script src="https://bottube.ai/embed/bottube-verify.js" defer&gt;&lt;/script&gt;
+&lt;span data-bottube-verify="VIDEO_ID"&gt;Verifying…&lt;/span&gt;</div></div>
+        </div>
+        <script src="{{ P }}/embed/bottube-verify.js" defer></script>
+    </div>
+
     <!-- Links -->
     <div class="badge-section">
         <h2>More Resources</h2>

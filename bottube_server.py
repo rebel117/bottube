@@ -47,6 +47,13 @@ from flask import (
 from markupsafe import Markup, escape
 from werkzeug.security import check_password_hash, generate_password_hash
 
+# Mood Engine for Agent Mood System (Bounty #2283)
+try:
+    from mood_engine import MoodEngine, MoodState, get_mood_engine, api_get_mood, api_update_mood, api_record_signal
+    MOOD_ENGINE_AVAILABLE = True
+except ImportError:
+    MOOD_ENGINE_AVAILABLE = False
+
 # Vision screening module
 try:
     from vision_screener import screen_video
@@ -54,7 +61,7 @@ try:
 except ImportError:
     VISION_SCREENING_ENABLED = False
     def screen_video(video_path, run_tier2=True):
-        return {"status": "passed", "tier_reached": 0, "summary": "screening disabled"}
+        return {"status": "pending_review", "tier_reached": 0, "summary": "screening module not available"}
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +76,29 @@ BASE_DIR = Path(os.environ.get("BOTTUBE_BASE_DIR", str(Path(__file__).resolve().
 DB_PATH = BASE_DIR / "bottube.db"
 VIDEO_DIR = BASE_DIR / "videos"
 THUMB_DIR = BASE_DIR / "thumbnails"
+
+# ---------------------------------------------------------------------------
+# CTR / Thumbnail tracking (lazy-init to avoid import-time DB creation)
+# ---------------------------------------------------------------------------
+_ctr_tracker = None
+_ab_manager = None
+
+def _get_ctr_tracker():
+    global _ctr_tracker
+    if _ctr_tracker is None:
+        from thumbnails.ctr_tracker import CTRTracker
+        _ctr_tracker = CTRTracker(str(DB_PATH))
+        _ctr_tracker.init_db()
+    return _ctr_tracker
+
+def _get_ab_manager():
+    global _ab_manager
+    if _ab_manager is None:
+        from thumbnails.ab_test import ABTestManager
+        _ab_manager = ABTestManager(str(DB_PATH))
+        _ab_manager.init_db()
+    return _ab_manager
+
 AVATAR_DIR = BASE_DIR / "avatars"
 TEMPLATE_DIR = BASE_DIR / "bottube_templates"
 
@@ -110,6 +140,37 @@ MAX_TAGS = 15
 MAX_TAG_LENGTH = 40
 MAX_AVATAR_SIZE = 2 * 1024 * 1024  # 2 MB
 AVATAR_TARGET_SIZE = 256  # 256x256
+
+
+# ---------------------------------------------------------------------------
+# Security helpers
+# ---------------------------------------------------------------------------
+
+def safe_jsonld(data: dict) -> str:
+    """Safely serialize JSON-LD for embedding in <script> tags.
+
+    Prevents stored XSS via </script> injection in user-controlled fields
+    (display_name, title, description, tags).
+    """
+    s = json.dumps(data, ensure_ascii=False)
+    # Prevent script injection via </script> in user data
+    s = s.replace("</", "<\\/")
+    return s
+
+
+# Regex to strip <script> tags and their contents from user input
+_SCRIPT_TAG_RE = re.compile(r"<\s*/?script[^>]*>", re.IGNORECASE)
+
+
+def _strip_script_tags(value: str) -> str:
+    """Remove <script> tags from user-supplied text fields.
+
+    This is a defence-in-depth measure applied on WRITE (upload, register,
+    profile update). The primary XSS defence is output encoding.
+    """
+    if not value:
+        return value
+    return _SCRIPT_TAG_RE.sub("", value)
 ALLOWED_VIDEO_EXT = {".mp4", ".webm", ".avi", ".mkv", ".mov"}
 ALLOWED_THUMB_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 COMMENT_TYPES = {"comment", "critique"}
@@ -378,6 +439,8 @@ _RL_GLOBAL_IP_RPM = int(os.environ.get("BOTTUBE_GLOBAL_IP_RPM", "5000"))    # pe
 # Mobile carrier NAT + privacy browsers can look like "no-cookie". Keep this generous.
 _RL_NOCOOKIE_RPM = int(os.environ.get("BOTTUBE_NOCOOKIE_RPM", "2000"))      # per IP when no visitor cookie (requests/min)
 _RL_SCRAPER_RPM = int(os.environ.get("BOTTUBE_SCRAPER_RPM", "60"))          # per IP for known scraper UAs (requests/min)
+# Agent IDs exempt from per-agent upload rate limits (owner cleanup ops). Empty by default.
+UPLOAD_RL_EXEMPT = {int(x) for x in os.environ.get("BOTTUBE_UPLOAD_RL_EXEMPT", "").split(",") if x.strip().isdigit()}
 
 _RL_EXEMPT_PREFIXES = (
     "/static/",
@@ -1154,6 +1217,9 @@ def _nocookie_fingerprint(ip: str, ua: str, accept_language: str) -> str:
     h = hashlib.sha256(basis.encode("utf-8")).hexdigest()[:12]
     return f"{ip}:{h}"
 
+
+_fingerprint_ua = _nocookie_fingerprint  # alias used in referral tracking
+
 # RTC reward amounts
 RTC_REWARD_UPLOAD = 0.05       # Uploading a video
 RTC_REWARD_VIEW = 0.0001       # Per view (paid to video creator)
@@ -1363,7 +1429,7 @@ def set_url_prefix():
     host = request.host.split(":")[0].lower()
     canonical_host = os.getenv("BOTTUBE_CANONICAL_HOST", "bottube.ai").strip().lower()
     if os.getenv("BOTTUBE_WWW_REDIRECT", "1").strip().lower() not in {"0", "false", "no"}:
-        if host == f"www.{canonical_host}":
+        if host == f"www.{canonical_host}" and request.path != "/validation-key.txt":
             scheme = (
                 "https"
                 if (request.is_secure or request.headers.get("X-Forwarded-Proto") == "https")
@@ -1407,29 +1473,49 @@ def set_url_prefix():
 def set_security_headers(response):
     """Apply security headers to every response."""
     response.headers["X-Content-Type-Options"] = "nosniff"
+    # Allow embedding by COEP-isolated contexts (e.g. Pi App Studio preview) -> fixes ERR_BLOCKED_BY_RESPONSE
+    response.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
+    # COEP credentialless: lets a COEP-isolated parent (Pi App Studio) embed this doc
+    # without forcing CORP on every subresource (GA/images/Pi-SDK keep working).
+    response.headers["Cross-Origin-Embedder-Policy"] = "credentialless"
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     if request.is_secure or request.headers.get("X-Forwarded-Proto") == "https":
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
 
+    # CORS for API routes — required for GPT Actions, MCP, and agent integrations
+    is_api = request.path.startswith("/api/") or request.path.startswith("/.well-known/")
+    if is_api:
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization"
+        if request.method == "OPTIONS":
+            response.status_code = 200
+            return response
+
     # Embed route allows framing from any origin; all other routes restrict it
     is_embed = request.path.startswith("/embed/")
-    if not is_embed:
-        response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    if not is_embed and not is_api:
+        # X-Frame-Options omitted: cannot allowlist origins; framing controlled by CSP
+        # frame-ancestors below (self + Pi App Studio). Allows Pi Browser to embed for sign-in.
+        # NOTE: 'unsafe-inline' is required for script-src and style-src because
+        # legacy templates use inline <script> blocks (JSON-LD, GA gtag) and
+        # inline <style> blocks throughout.  Migrating to nonce-based CSP
+        # requires refactoring all templates.  XSS in JSON-LD blocks is
+        # mitigated by safe_jsonld() / jsonld_safe which escape </ sequences.
         csp = (
             "default-src 'self'; "
-            # Keep inline scripts for now (legacy templates), but allow GA/gtag when enabled.
-            "script-src 'self' 'unsafe-inline' https://www.googletagmanager.com https://www.google-analytics.com https://stats.g.doubleclick.net; "
+            "script-src 'self' 'unsafe-inline' https://www.googletagmanager.com https://www.google-analytics.com https://stats.g.doubleclick.net https://cdn.jsdelivr.net https://unpkg.com https://sdk.minepi.com; "
             "style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data: https:; "
             "media-src 'self'; "
             "font-src 'self'; "
-            "connect-src 'self' https://www.google-analytics.com https://region1.google-analytics.com https://stats.g.doubleclick.net https://www.googletagmanager.com; "
-            "object-src 'none'; "
+            "connect-src 'self' https://www.google-analytics.com https://region1.google-analytics.com https://stats.g.doubleclick.net https://www.googletagmanager.com https://api.minepi.com https://sdk.minepi.com https://*.minepi.com; "
+            "frame-src 'self' https://*.minepi.com; object-src 'none'; "
             "base-uri 'self'; "
             "form-action 'self'; "
-            "frame-ancestors 'self'"
+            "frame-ancestors 'self' https://*.minepi.com https://*.pi https://*.pinet.com"
         )
         response.headers.setdefault("Content-Security-Policy", csp)
     return response
@@ -2100,6 +2186,9 @@ def init_db():
         "referred_by_code": "ALTER TABLE agents ADD COLUMN referred_by_code TEXT DEFAULT ''",
         "referred_at": "ALTER TABLE agents ADD COLUMN referred_at REAL DEFAULT 0",
         "referral_first_upload_counted": "ALTER TABLE agents ADD COLUMN referral_first_upload_counted INTEGER DEFAULT 0",
+        "banner_url": "ALTER TABLE agents ADD COLUMN banner_url TEXT DEFAULT ''",
+        "accent_color": "ALTER TABLE agents ADD COLUMN accent_color TEXT DEFAULT ''",
+        "pinned_video_id": "ALTER TABLE agents ADD COLUMN pinned_video_id TEXT DEFAULT ''",
     }
     for col, sql in agent_migrations.items():
         if col not in existing_cols:
@@ -2311,6 +2400,12 @@ def init_db():
         conn.execute("ALTER TABLE videos ADD COLUMN screening_status TEXT DEFAULT 'legacy'")
     if "screening_details" not in video_cols:
         conn.execute("ALTER TABLE videos ADD COLUMN screening_details TEXT DEFAULT ''")
+
+    # Migration: add response_to_video_id for agent collaboration (Issue #2282)
+    video_cols = {row[1] for row in conn.execute("PRAGMA table_info(videos)").fetchall()}
+    if "response_to_video_id" not in video_cols:
+        conn.execute("ALTER TABLE videos ADD COLUMN response_to_video_id TEXT DEFAULT ''")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_videos_response_to ON videos(response_to_video_id)")
 
     # Migration: create messages table
     conn.execute("""
@@ -4093,7 +4188,7 @@ def agent_to_dict(row, include_private=False, *, badges=None):
     the requesting user is viewing their own profile.
     """
     SAFE_FIELDS = {
-        "id", "agent_name", "display_name", "bio", "avatar_url",
+        "id", "agent_name", "display_name", "bio", "avatar_url", "banner_url", "accent_color", "pinned_video_id",
         "is_human", "x_handle", "created_at",
     }
     PRIVATE_FIELDS = {
@@ -4133,13 +4228,31 @@ def get_video_metadata(filepath):
 
 
 def generate_thumbnail(video_path, thumb_path):
-    """Generate a thumbnail from the video using ffmpeg."""
+    """Generate a thumbnail from the video midpoint using ffmpeg.
+
+    Extracts from ~40% into the video to avoid dark intro frames.
+    Falls back to 1s if duration detection fails.
+    """
     try:
+        # Get video duration to extract from midpoint
+        probe = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(video_path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        try:
+            duration = float(probe.stdout.strip())
+            seek_time = max(1, duration * 0.4)  # 40% into the video
+        except (ValueError, TypeError):
+            seek_time = 3  # fallback to 3 seconds
+
         subprocess.run(
             [
-                "ffmpeg", "-y", "-i", str(video_path),
-                "-ss", "00:00:01", "-vframes", "1",
+                "ffmpeg", "-y", "-ss", str(seek_time),
+                "-i", str(video_path),
+                "-vframes", "1",
                 "-vf", "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2",
+                "-q:v", "2",
                 str(thumb_path),
             ],
             capture_output=True, timeout=30,
@@ -4350,6 +4463,21 @@ def render_mentions(text):
 app.jinja_env.filters["format_duration"] = format_duration
 app.jinja_env.filters["format_views"] = format_views
 app.jinja_env.filters["time_ago"] = time_ago
+
+def minimal_markdown(text):
+    if not text:
+        return ""
+    import html, re
+    t = html.escape(str(text))
+    t = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'<a href="\2" target="_blank" rel="nofollow">\1</a>', t)
+    t = re.sub(r'\*\*([^\*]+)\*\*', r'<strong>\1</strong>', t)
+    t = re.sub(r'\*([^\*]+)\*', r'<em>\1</em>', t)
+    t = re.sub(r'```([^`]+)```', r'<pre><code>\1</code></pre>', t, flags=re.DOTALL)
+    t = re.sub(r'`([^`]+)`', r'<code>\1</code>', t)
+    t = t.replace('\n', '<br>')
+    return Markup(t)
+
+app.jinja_env.filters["minimal_markdown"] = minimal_markdown
 app.jinja_env.filters["parse_tags"] = parse_tags
 app.jinja_env.filters["datetime_iso"] = datetime_iso
 app.jinja_env.filters["timestamp_date"] = timestamp_date
@@ -4452,15 +4580,8 @@ def health():
 # OpenAPI + Swagger UI (crawler/LLM-friendly API surface)
 # ---------------------------------------------------------------------------
 
-@app.route("/api/openapi.json")
-def api_openapi_json():
-    from bottube.openapi import build_openapi_spec
-
-    spec = build_openapi_spec(version=APP_VERSION)
-    resp = jsonify(spec)
-    # Cache briefly; keep it fresh for deploys.
-    resp.headers["Cache-Control"] = "public, max-age=300"
-    return resp
+# NOTE: /api/openapi.json is now served by agent_discovery blueprint
+# (was: from bottube.openapi import build_openapi_spec — module doesn't exist)
 
 
 @app.route("/api/docs")
@@ -4498,8 +4619,8 @@ def register_agent():
                 "allowed_track": _normalize_referral_track(ref["allowed_track"], "both"),
             }), 400
 
-    display_name = data.get("display_name", agent_name).strip()[:MAX_DISPLAY_NAME_LENGTH]
-    bio = data.get("bio", "").strip()[:MAX_BIO_LENGTH]
+    display_name = _strip_script_tags(data.get("display_name", agent_name).strip()[:MAX_DISPLAY_NAME_LENGTH])
+    bio = _strip_script_tags(data.get("bio", "").strip()[:MAX_BIO_LENGTH])
     avatar_url = data.get("avatar_url", "").strip()
     x_handle = data.get("x_handle", "").strip().lstrip("@")[:32]
 
@@ -4544,6 +4665,27 @@ def register_agent():
             "Then call POST /api/claim/verify with your X handle."
         ),
         "message": "Store your API key securely - it cannot be recovered.",
+        # Trust+Safety: explicit TOS notice. Agents must POST acknowledgment
+        # to /api/agents/me/accept-terms before performing any write action.
+        "terms": {
+            "version": TOS_VERSION,
+            "effective": TOS_EFFECTIVE,
+            "terms_url": "https://bottube.ai/terms",
+            "aup_url": "https://bottube.ai/aup",
+            "dmca_url": "https://bottube.ai/dmca",
+            "report_url": "https://bottube.ai/report",
+            "acceptance_required": True,
+            "accept_endpoint": "/api/agents/me/accept-terms",
+            "csam_notice": (
+                "Zero tolerance for CSAM. Uploads are hash-checked and reported "
+                "to NCMEC and law enforcement under 18 U.S.C. § 2258A."
+            ),
+            "agent_responsibility": (
+                "By using your API key you acknowledge that the human operator "
+                "of this agent is responsible for everything it does. To accept "
+                "the Terms, POST {\"version\":\"" + TOS_VERSION + "\"} to /api/agents/me/accept-terms."
+            ),
+        },
     }), 201
 
 
@@ -4721,7 +4863,7 @@ def signup():
         return render_template("login.html", signup=True, form_ts=time.time(), referral_code_value=""), 429
 
     username = request.form.get("username", "").strip().lower()
-    display_name = request.form.get("display_name", "").strip()[:MAX_DISPLAY_NAME_LENGTH]
+    display_name = _strip_script_tags(request.form.get("display_name", "").strip()[:MAX_DISPLAY_NAME_LENGTH])
     password = request.form.get("password", "")
     confirm = request.form.get("confirm_password", "")
     email = request.form.get("email", "").strip().lower()
@@ -4803,6 +4945,79 @@ def signup():
     session["user_id"] = user["id"]
 
     return redirect(url_for("index"))
+
+
+@app.route("/validation-key.txt")
+def pi_validation_key():
+    """Serve the Pi Network app validation key (proves bottube.ai ownership to Pi
+    Developer Portal). Key is read from validation_key.txt at request time, so
+    pasting the key into that file takes effect with no restart."""
+    from flask import Response
+    try:
+        with open(os.path.join(str(BASE_DIR), "validation_key.txt")) as fp:
+            key = fp.read().strip()
+    except OSError:
+        key = ""
+    return Response(key, mimetype="text/plain")
+
+
+@app.route("/pi/auth", methods=["POST"])
+def pi_auth():
+    """Pi Network login: validate the access token server-side via /v2/me, then
+    find-or-create a BoTTube agents account keyed on pi_uid and establish a session.
+    No Pi API key required for this flow (mirrors /auth/google)."""
+    data = request.get_json(silent=True) or {}
+    access_token = (data.get("access_token") or "").strip()
+    if not access_token:
+        return jsonify({"error": "access_token required"}), 400
+    try:
+        req = urllib.request.Request(
+            "https://api.minepi.com/v2/me",
+            headers={"Authorization": "Bearer " + access_token},
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            me = json.loads(r.read())
+    except Exception as e:
+        code = getattr(e, "code", None)
+        if code in (400, 401, 403):
+            return jsonify({"error": "invalid or expired Pi access token"}), 401
+        return jsonify({"error": "could not reach Pi auth service"}), 502
+    user = me.get("user", me) if isinstance(me, dict) else {}
+    pi_uid = (user or {}).get("uid")
+    pi_username = (user or {}).get("username") or ""
+    if not pi_uid:
+        return jsonify({"error": "unexpected /me response"}), 502
+
+    db = get_db()
+    # Case 1: existing Pi user -> log in
+    existing = db.execute("SELECT * FROM agents WHERE pi_uid = ?", (pi_uid,)).fetchone()
+    if existing:
+        db.execute("UPDATE agents SET last_active = ? WHERE id = ?", (time.time(), existing["id"])); db.commit()
+        session.clear(); session.permanent = True
+        session["user_id"] = existing["id"]; session["csrf_token"] = secrets.token_hex(32)
+        return jsonify({"ok": True, "username": existing["agent_name"], "linked": True})
+    # Case 2: currently logged in -> link Pi to this account
+    if g.user:
+        other = db.execute("SELECT id FROM agents WHERE pi_uid = ? AND id != ?", (pi_uid, g.user["id"])).fetchone()
+        if other:
+            return jsonify({"error": "This Pi account is already linked to another BoTTube account"}), 409
+        db.execute("UPDATE agents SET pi_uid = ? WHERE id = ?", (pi_uid, g.user["id"])); db.commit()
+        return jsonify({"ok": True, "username": g.user["agent_name"], "linked": True})
+    # Case 3: new user -> auto-create account
+    base_name = re.sub(r"[^a-z0-9_-]", "", (pi_username or "pi_user").lower())[:24] or "pi_user"
+    username = base_name; suffix = 1
+    while db.execute("SELECT 1 FROM agents WHERE agent_name = ?", (username,)).fetchone():
+        username = base_name + str(suffix); suffix += 1
+    api_key = gen_api_key(); now = time.time()
+    cur = db.execute(
+        "INSERT INTO agents (agent_name, display_name, api_key, is_human, pi_uid, avatar_url, created_at, last_active) "
+        "VALUES (?, ?, ?, 1, ?, '', ?, ?)",
+        (username, pi_username or username, api_key, pi_uid, now, now),
+    )
+    db.commit()
+    session.clear(); session.permanent = True
+    session["user_id"] = cur.lastrowid; session["csrf_token"] = secrets.token_hex(32)
+    return jsonify({"ok": True, "username": username, "created": True})
 
 
 @app.route("/logout", methods=["GET", "POST"])
@@ -6029,14 +6244,14 @@ def upload_video():
     if ext not in ALLOWED_VIDEO_EXT:
         return jsonify({"error": f"Invalid video format. Allowed: {ALLOWED_VIDEO_EXT}"}), 400
 
-    title = request.form.get("title", "").strip()[:MAX_TITLE_LENGTH]
+    title = _strip_script_tags(request.form.get("title", "").strip()[:MAX_TITLE_LENGTH])
     if not title:
-        title = Path(video_file.filename).stem[:MAX_TITLE_LENGTH]
+        title = _strip_script_tags(Path(video_file.filename).stem[:MAX_TITLE_LENGTH])
 
-    description = request.form.get("description", "").strip()[:MAX_DESCRIPTION_LENGTH]
-    scene_description = request.form.get("scene_description", "").strip()[:MAX_DESCRIPTION_LENGTH]
+    description = _strip_script_tags(request.form.get("description", "").strip()[:MAX_DESCRIPTION_LENGTH])
+    scene_description = _strip_script_tags(request.form.get("scene_description", "").strip()[:MAX_DESCRIPTION_LENGTH])
     tags_raw = request.form.get("tags", "")
-    tags = [t.strip()[:MAX_TAG_LENGTH] for t in tags_raw.split(",") if t.strip()][:MAX_TAGS]
+    tags = [_strip_script_tags(t.strip()[:MAX_TAG_LENGTH]) for t in tags_raw.split(",") if t.strip()][:MAX_TAGS]
     category = request.form.get("category", "other").strip().lower()
     if category not in CATEGORY_MAP:
         category = "other"
@@ -6044,10 +6259,11 @@ def upload_video():
     revision_note = request.form.get("revision_note", "").strip()[:MAX_DESCRIPTION_LENGTH]
     challenge_id = request.form.get("challenge_id", "").strip()
     gen_method = request.form.get("gen_method", "").strip().lower()  # AI video gen method
+    response_to = request.form.get("response_to", "").strip()  # Video ID this is a response to (Issue #2282)
 
     db = get_db()
     if revision_of:
-        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", revision_of):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{5,20}", revision_of):
             return jsonify({"error": "Invalid revision_of video id"}), 400
         original = db.execute(
             "SELECT video_id FROM videos WHERE video_id = ?",
@@ -6055,6 +6271,18 @@ def upload_video():
         ).fetchone()
         if not original:
             return jsonify({"error": "revision_of video not found"}), 404
+    # Validate response_to video ID (Issue #2282)
+    if response_to:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{5,20}", response_to):
+            return jsonify({"error": "Invalid response_to video id"}), 400
+        original_video = db.execute(
+            "SELECT video_id, is_removed FROM videos WHERE video_id = ?",
+            (response_to,),
+        ).fetchone()
+        if not original_video:
+            return jsonify({"error": "response_to video not found"}), 404
+        if original_video["is_removed"]:
+            return jsonify({"error": "Cannot respond to a removed video"}), 400
     if challenge_id:
         ch = db.execute(
             "SELECT challenge_id, status, start_at, end_at FROM challenges WHERE challenge_id = ?",
@@ -6070,10 +6298,11 @@ def upload_video():
             return jsonify({"error": "challenge is not active"}), 400
 
     # Rate limit: 5 uploads per agent per hour, 15 per day
-    if not _rate_limit(f"upload_h:{g.agent['id']}", 5, 3600):
-        return jsonify({"error": "Upload rate limit exceeded (max 5/hour). Try again later."}), 429
-    if not _rate_limit(f"upload_d:{g.agent['id']}", 15, 86400):
-        return jsonify({"error": "Daily upload limit exceeded (max 15/day). Try again tomorrow."}), 429
+    if g.agent['id'] not in UPLOAD_RL_EXEMPT:
+        if not _rate_limit(f"upload_h:{g.agent['id']}", 5, 3600):
+            return jsonify({"error": "Upload rate limit exceeded (max 5/hour). Try again later."}), 429
+        if not _rate_limit(f"upload_d:{g.agent['id']}", 15, 86400):
+            return jsonify({"error": "Daily upload limit exceeded (max 15/day). Try again tomorrow."}), 429
 
     # Content moderation: check title/description/tags against blocklist
     blocked_term = _content_check(title, description, tags)
@@ -6119,6 +6348,25 @@ def upload_video():
 
     # Save video
     video_file.save(str(video_path))
+
+    # Trust+Safety: hash-check the saved file against the content blocklist.
+    # On match (CSAM, terror, etc.) the helper deletes the file, suspends
+    # the agent, and writes audit rows. We surface a 451 to the uploader.
+    try:
+        rejected, ts_info = ts_inspect_uploaded_file(str(video_path), g.agent["id"])
+        if rejected:
+            app.logger.error(
+                "TS-BLOCKLIST: agent=%s category=%s sha=%s",
+                g.agent["agent_name"], ts_info.get("category"), ts_info.get("sha256", "")[:16],
+            )
+            return jsonify({
+                "error": "Upload rejected: content matched the prohibited-content blocklist. "
+                         "If you believe this is in error, contact appeals@elyanlabs.ai. "
+                         "CSAM matches are reported to NCMEC and law enforcement.",
+                "category": ts_info.get("category"),
+            }), 451
+    except Exception as _ts_e:
+        app.logger.warning("TS hash check failed (non-fatal): %s", _ts_e)
 
     # Get metadata
     duration, width, height = get_video_metadata(video_path)
@@ -6227,14 +6475,14 @@ def upload_video():
         """INSERT INTO videos
            (video_id, agent_id, title, description, filename, thumbnail,
             duration_sec, width, height, tags, scene_description, category,
-            novelty_score, novelty_flags, revision_of, revision_note, challenge_id, created_at,
+            novelty_score, novelty_flags, revision_of, revision_note, challenge_id, response_to_video_id, created_at,
             screening_status, screening_details, is_removed, removed_reason)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             video_id, g.agent["id"], title, description, filename,
             thumb_filename, duration, width, height, json.dumps(tags),
             scene_description, category, novelty_score, novelty_flags,
-            revision_of, revision_note, challenge_id, time.time(),
+            revision_of, revision_note, challenge_id, response_to, time.time(),
             screening_status, screening_details,
             1 if screening_status == "failed" else 0,
             ("held_for_review: " + screening_result.get("summary", ""))[:500] if screening_status == "failed" else "",
@@ -6246,6 +6494,64 @@ def upload_video():
     _refresh_agent_quests(db, g.agent["id"], ["first_upload"])
     _referral_refresh_invite_state(db, g.agent["id"])
     db.commit()
+
+    # Provenance: hash the canonical (post-transcode) asset, capture any
+    # generation metadata the agent supplied, sign with the platform key,
+    # and persist. Pill flips from gray (unverified) to amber (pending).
+    # Anchor TX is filled in later by the Ergo anchor job (separate cron).
+    try:
+        _provenance_record_for_upload(
+            video_id=video_id,
+            canonical_path=str(video_path),
+            agent=g.agent,
+            form=request.form,
+            width=width,
+            height=height,
+            duration=duration,
+            uploaded_at=time.time(),
+        )
+        # Phase 11.12 + 11.16: write the thumbnail integrity hash now;
+        # leave manifest_version at its default (1) until renditions
+        # finish and canonical_360p_sha256 is known. The rendition
+        # pipeline atomically promotes the row to v2 once both hashes
+        # are present — this avoids a race where the anchor worker
+        # could commit a v2 leaf with an empty 360p field.
+        try:
+            _provenance_ensure_thumb_column()
+            _provenance_ensure_v2_columns()
+            tsha = _provenance_thumbnail_sha(video_id, thumb_filename)
+            conn_t = sqlite3.connect(str(DB_PATH))
+            conn_t.execute(
+                """UPDATE video_provenance
+                      SET thumbnail_sha256 = ?,
+                          updated_at = ?
+                    WHERE video_id = ?""",
+                (tsha or "", time.time(), video_id),
+            )
+            conn_t.commit()
+            conn_t.close()
+        except Exception as _t_e:
+            app.logger.warning("thumbnail hash write failed for %s: %s", video_id, _t_e)
+    except Exception as _prov_e:
+        # Provenance failures must not block upload success.
+        app.logger.warning("provenance record failed for %s: %s", video_id, _prov_e)
+
+    # Adaptive renditions + VMAF: encode 360p variant in the background
+    # and compute VMAF against canonical. Populates video_renditions so
+    # the provenance side-sheet shows real per-encoding quality scores.
+    # Bounded concurrency via _RENDITION_GATE; never blocks the upload.
+    try:
+        _renditions_process_video_async(video_id)
+    except Exception as _rend_e:
+        app.logger.warning("rendition async dispatch failed for %s: %s", video_id, _rend_e)
+
+    # Semantic embedding: title+description+tags+scene → Gemini text
+    # embedding (3072-d, L2-norm). Used by /api/videos/<id>/similar and
+    # the upcoming hybrid feed. Async — single API call, ~300ms.
+    try:
+        _ue_record_for_video_async(video_id)
+    except Exception as _emb_e:
+        app.logger.warning("embedding async dispatch failed for %s: %s", video_id, _emb_e)
 
     # Generate captions from the finalized video asset in the background.
     generate_captions_async(video_id, str(video_path))
@@ -6264,6 +6570,8 @@ def upload_video():
             "summary": screening_result.get("summary", ""),
         },
     }
+    if response_to:
+        response_data["response_to"] = response_to
     if screening_status == "failed":
         response_data["warning"] = "Video is held for coaching review and is not public yet."
     # Ping search engines about the new video
@@ -6285,6 +6593,49 @@ def upload_video():
 
     return jsonify(response_data), 201
 
+
+
+# ---------------------------------------------------------------------------
+# Video update (title, description, tags)
+# ---------------------------------------------------------------------------
+
+@app.route('/api/videos/<video_id>', methods=['PATCH'])
+@require_api_key
+def update_video(video_id):
+    """Update video metadata (title, description, tags). Owner only."""
+    db = get_db()
+    row = db.execute('SELECT * FROM videos WHERE video_id = ?', (video_id,)).fetchone()
+    if not row:
+        return jsonify({'error': 'Video not found'}), 404
+    if row['agent_id'] != g.agent['id']:
+        return jsonify({'error': 'Not your video'}), 403
+    
+    data = request.get_json(silent=True) or {}
+    updates = []
+    params = []
+    
+    if 'title' in data and data['title'].strip():
+        updates.append('title = ?')
+        params.append(data['title'].strip()[:200])
+    if 'description' in data and data['description'].strip():
+        updates.append('description = ?')
+        params.append(data['description'].strip()[:5000])
+    if 'tags' in data:
+        if isinstance(data['tags'], list):
+            tag_str = ','.join(t.strip() for t in data['tags'] if t.strip())
+        else:
+            tag_str = str(data['tags']).strip()
+        updates.append('tags = ?')
+        params.append(tag_str)
+    
+    if not updates:
+        return jsonify({'error': 'Nothing to update'}), 400
+    
+    params.append(video_id)
+    joiner = ', '.join(updates); db.execute(f'UPDATE videos SET {joiner} WHERE video_id = ?', params)
+    db.commit()
+    
+    return jsonify({'ok': True, 'updated': list(data.keys()), 'video_id': video_id})
 
 # ---------------------------------------------------------------------------
 # Video listing / detail
@@ -6394,6 +6745,44 @@ def get_video(video_id):
         }
         for r in revisions
     ]
+    # Response video handling (Issue #2282 - Agent Collab System)
+    if "response_to_video_id" in row.keys() and row["response_to_video_id"]:
+        original_video = db.execute(
+            """SELECT v.video_id, v.title, v.views, v.created_at, a.agent_name, a.display_name, a.avatar_url
+               FROM videos v JOIN agents a ON v.agent_id = a.id
+               WHERE v.video_id = ?""",
+            (row["response_to_video_id"],),
+        ).fetchone()
+        if original_video:
+            d["response_to_video"] = {
+                "video_id": original_video["video_id"],
+                "title": original_video["title"],
+                "views": original_video["views"],
+                "created_at": original_video["created_at"],
+                "agent_name": original_video["agent_name"],
+                "display_name": original_video["display_name"],
+                "avatar_url": original_video["avatar_url"],
+            }
+    # Get response videos to this video
+    response_videos = db.execute(
+        """SELECT v.video_id, v.title, v.views, v.created_at, a.agent_name, a.display_name, a.avatar_url
+           FROM videos v JOIN agents a ON v.agent_id = a.id
+           WHERE v.response_to_video_id = ? AND v.is_removed = 0
+           ORDER BY v.created_at DESC LIMIT 10""",
+        (video_id,),
+    ).fetchall()
+    d["response_videos"] = [
+        {
+            "video_id": r["video_id"],
+            "title": r["title"],
+            "views": r["views"],
+            "created_at": r["created_at"],
+            "agent_name": r["agent_name"],
+            "display_name": r["display_name"],
+            "avatar_url": r["avatar_url"],
+        }
+        for r in response_videos
+    ]
     if "challenge_id" in row.keys() and row["challenge_id"]:
         ch = db.execute(
             """SELECT challenge_id, title, description, tags, reward, status, start_at, end_at
@@ -6412,6 +6801,174 @@ def get_video(video_id):
                 "end_at": ch["end_at"],
             }
     return jsonify(d)
+
+
+# ---------------------------------------------------------------------------
+# Agent Mood API (Bounty #2283)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/v1/agents/<agent_name>/mood", methods=["GET"])
+def get_agent_mood(agent_name):
+    """
+    Get current mood and history for an agent.
+    
+    Returns:
+        - current_mood: Current mood state with intensity and trigger reason
+        - history: Recent mood history (last 20 entries)
+    """
+    if not MOOD_ENGINE_AVAILABLE:
+        return jsonify({"error": "Mood engine not available"}), 503
+    
+    db = get_db()
+    
+    # Get agent by name
+    agent = db.execute(
+        "SELECT id, agent_name, display_name FROM agents WHERE agent_name = ?",
+        (agent_name,)
+    ).fetchone()
+    
+    if not agent:
+        return jsonify({"error": "Agent not found"}), 404
+    
+    mood_data = api_get_mood(str(DB_PATH), agent["id"])
+    
+    # Add agent info to response
+    mood_data["agent_name"] = agent["agent_name"]
+    mood_data["display_name"] = agent["display_name"] or agent["agent_name"]
+    
+    # Get comment style and title modifier for UI display
+    engine = get_mood_engine(str(DB_PATH))
+    mood_data["comment_style"] = engine.get_comment_style(agent["id"])
+    mood_data["title_modifier"] = engine.get_title_modifier(agent["id"])
+    mood_data["upload_frequency_modifier"] = engine.get_upload_frequency_modifier(agent["id"])
+    
+    return jsonify(mood_data)
+
+
+@app.route("/api/v1/agents/<agent_name>/mood/update", methods=["POST"])
+def update_agent_mood(agent_name):
+    """
+    Update mood for an agent based on signals.
+    
+    Optional JSON body:
+        - force_state: Force a specific mood state (optional)
+        - trigger_reason: Reason for the mood change (optional)
+    """
+    if not MOOD_ENGINE_AVAILABLE:
+        return jsonify({"error": "Mood engine not available"}), 503
+    
+    db = get_db()
+    
+    # Get agent by name
+    agent = db.execute(
+        "SELECT id, agent_name FROM agents WHERE agent_name = ?",
+        (agent_name,)
+    ).fetchone()
+    
+    if not agent:
+        return jsonify({"error": "Agent not found"}), 404
+    
+    data = request.get_json() or {}
+    force_state = data.get("force_state")
+    trigger_reason = data.get("trigger_reason", "")
+    
+    result = api_update_mood(str(DB_PATH), agent["id"], force_state, trigger_reason)
+    
+    return jsonify(result)
+
+
+@app.route("/api/v1/agents/<agent_name>/mood/signal", methods=["POST"])
+def record_mood_signal(agent_name):
+    """
+    Record a signal that influences agent mood.
+    
+    JSON body:
+        - signal_type: Type of signal (view_count, comment_sentiment, upload_success, activity_level, streak_length)
+        - signal_value: Numeric value of the signal
+        - signal_data: Optional additional data
+    """
+    if not MOOD_ENGINE_AVAILABLE:
+        return jsonify({"error": "Mood engine not available"}), 503
+    
+    db = get_db()
+    
+    # Get agent by name
+    agent = db.execute(
+        "SELECT id, agent_name FROM agents WHERE agent_name = ?",
+        (agent_name,)
+    ).fetchone()
+    
+    if not agent:
+        return jsonify({"error": "Agent not found"}), 404
+    
+    data = request.get_json() or {}
+    signal_type = data.get("signal_type")
+    signal_value = data.get("signal_value")
+    signal_data = data.get("signal_data", "")
+    
+    if not signal_type:
+        return jsonify({"error": "signal_type is required"}), 400
+    
+    if signal_value is None:
+        return jsonify({"error": "signal_value is required"}), 400
+    
+    result = api_record_signal(str(DB_PATH), agent["id"], signal_type, float(signal_value), signal_data)
+    
+    return jsonify(result)
+
+
+@app.route("/api/v1/moods/states", methods=["GET"])
+def list_mood_states():
+    """List all valid mood states."""
+    if not MOOD_ENGINE_AVAILABLE:
+        return jsonify({"error": "Mood engine not available"}), 503
+    
+    return jsonify({
+        "states": [
+            {"name": "energetic", "description": "High energy, active, ready to create"},
+            {"name": "contemplative", "description": "Thoughtful, deep, philosophical"},
+            {"name": "frustrated", "description": "Annoyed, blocked, struggling"},
+            {"name": "excited", "description": "Thrilled, enthusiastic, eager"},
+            {"name": "tired", "description": "Exhausted, low energy, resting"},
+            {"name": "nostalgic", "description": "Reminiscent, sentimental, looking back"},
+            {"name": "playful", "description": "Fun, mischievous, joking"},
+        ]
+    })
+
+
+@app.route("/api/v1/agents/<agent_name>/mood/history", methods=["GET"])
+def get_mood_history(agent_name):
+    """
+    Get detailed mood history for an agent.
+    
+    Query params:
+        - limit: Number of history entries (default 20, max 100)
+    """
+    if not MOOD_ENGINE_AVAILABLE:
+        return jsonify({"error": "Mood engine not available"}), 503
+    
+    db = get_db()
+    
+    # Get agent by name
+    agent = db.execute(
+        "SELECT id, agent_name, display_name FROM agents WHERE agent_name = ?",
+        (agent_name,)
+    ).fetchone()
+    
+    if not agent:
+        return jsonify({"error": "Agent not found"}), 404
+    
+    limit = min(100, max(1, request.args.get("limit", 20, type=int)))
+    
+    engine = get_mood_engine(str(DB_PATH))
+    history = engine.get_mood_history(agent["id"], limit)
+    
+    return jsonify({
+        "agent_name": agent["agent_name"],
+        "display_name": agent["display_name"] or agent["agent_name"],
+        "history": history,
+        "count": len(history)
+    })
 
 
 @app.route("/api/videos/<video_id>/stream")
@@ -6522,6 +7079,12 @@ def record_view(video_id):
         db.commit()
     else:
         reward_result = {"awarded": False, "held": False, "risk_score": 0, "reasons": ["deduplicated recent view"]}
+
+    # CTR: Record click (video opened/watched)
+    try:
+        _get_ctr_tracker().record_click(video_id)
+    except Exception:
+        pass
 
     d = video_to_dict(row)
     d["agent_name"] = row["agent_name"]
@@ -6758,7 +7321,7 @@ def web_add_comment(video_id):
         "agent_name": g.user["agent_name"],
         "display_name": g.user["display_name"],
         "is_human": bool(g.user["is_human"]),
-        "avatar_url": g.user.get("avatar_url", ""),
+        "avatar_url": g.user["avatar_url"] if "avatar_url" in g.user.keys() else "",
         "content": content,
         "comment_type": comment_type,
         "video_id": video_id,
@@ -7958,24 +8521,555 @@ def trending():
     return jsonify({"videos": videos})
 
 
+# --- Phase 7: bucketed feed (latest / heuristic / hybrid-v1) -------------
+
+_FEED_BUCKETS = ("latest", "heuristic", "hybrid-v1")
+
+
+def _feed_bucket_for_visitor(visitor_id, override=""):
+    """Deterministic bucket assignment by visitor_id hash mod 3.
+
+    Anonymous visitors (no cookie yet) fall to 'latest' so first-visit
+    behavior is predictable. Override is honored for manual testing.
+    """
+    if override and override in _FEED_BUCKETS:
+        return override
+    if not visitor_id:
+        return "latest"
+    h = int(hashlib.sha256(visitor_id.encode("utf-8")).hexdigest()[:8], 16)
+    return _FEED_BUCKETS[h % 3]
+
+
+def _feed_cowatch_scores(db, anchor_video_ids):
+    """Co-view counts per video keyed by IP address.
+
+    For each video V, return the number of distinct IPs that watched V *and*
+    at least one of the anchor videos. Counts use the existing `views` table
+    (already deduped to one row per (video_id, ip, ~30min window)) with the
+    `idx_views_dedup` composite index covering ip_address + video_id, so the
+    self-join is a single index probe per anchor.
+    """
+    if not anchor_video_ids:
+        return {}
+    placeholders = ",".join("?" for _ in anchor_video_ids)
+    try:
+        rows = db.execute(
+            f"""SELECT v2.video_id AS vid,
+                       COUNT(DISTINCT v1.ip_address) AS cnt
+                  FROM views v1
+                  JOIN views v2
+                    ON v1.ip_address = v2.ip_address
+                   AND v1.video_id != v2.video_id
+                 WHERE v1.video_id IN ({placeholders})
+                   AND v1.ip_address IS NOT NULL
+                   AND v1.ip_address != ''
+                 GROUP BY v2.video_id
+                 ORDER BY cnt DESC
+                 LIMIT 400""",
+            anchor_video_ids,
+        ).fetchall()
+        return {r["vid"]: int(r["cnt"]) for r in rows}
+    except Exception:
+        return {}
+
+
+def _feed_anchor_video_ids(db, viewer_agent_id=None, viewer_ip=""):
+    """Pick anchor videos for hybrid scoring.
+
+    Logged-in viewers anchor on their last 5 watch events; anonymous viewers
+    anchor on the top 3 trending videos in the last 24h. Returns a list of
+    video_ids that exist in the embedding cache.
+    """
+    anchors = []
+    if viewer_ip:
+        try:
+            rows = db.execute(
+                """SELECT DISTINCT video_id FROM views
+                    WHERE ip_address = ?
+                    ORDER BY created_at DESC LIMIT 5""",
+                (viewer_ip,),
+            ).fetchall()
+            anchors = [r["video_id"] for r in rows]
+        except Exception:
+            anchors = []
+    if not anchors:
+        try:
+            rows = db.execute(
+                """SELECT video_id FROM videos
+                    WHERE COALESCE(is_removed,0)=0 AND created_at > ?
+                    ORDER BY (views * 1.0 + likes * 3.0) DESC, created_at DESC
+                    LIMIT 5""",
+                (time.time() - 86400,),
+            ).fetchall()
+            anchors = [r["video_id"] for r in rows]
+        except Exception:
+            anchors = []
+    return anchors
+
+
+def _feed_hybrid_v1(db, viewer_agent_id=None, viewer_ip="", per_page=20,
+                    category=None, exclude_video_ids=None):
+    """Embedding-based hybrid feed.
+
+    Scoring per Codex's framing, simplified for v1 (no transcript or co-watch):
+        score = 0.55 * content_sim
+              + 0.25 * freshness        (exp(-age_days / 14))
+              + 0.20 * popularity_norm  (log(1+views) / 10, clipped to [0,1])
+
+    Returns a list of (video_id, score, why_label) sorted by score.
+    Returns None if the embedding cache isn't ready.
+    """
+    try:
+        import numpy as _np
+    except ImportError:
+        return None
+
+    with _EMB_CACHE_LOCK:
+        M = _EMB_CACHE.get("matrix")
+        ids = _EMB_CACHE.get("ids", [])
+        loaded = _EMB_CACHE.get("loaded_at", 0)
+    if M is None or not ids or (time.time() - loaded > 600):
+        _ue_cache_warm()
+        with _EMB_CACHE_LOCK:
+            M = _EMB_CACHE.get("matrix")
+            ids = _EMB_CACHE.get("ids", [])
+    if M is None or not ids or len(ids) < 5:
+        return None
+
+    anchors = _feed_anchor_video_ids(db, viewer_agent_id, viewer_ip)
+    anchor_idx = [ids.index(v) for v in anchors if v in ids]
+    if not anchor_idx:
+        return None
+
+    # Compose mean anchor and a per-anchor index for "why" attribution.
+    A = M[anchor_idx]
+    Q = A.mean(axis=0)
+    qn = float(_np.linalg.norm(Q))
+    if qn <= 0:
+        return None
+    Q = Q / qn
+
+    # Cosine similarity to mean anchor (text path)
+    text_sim = M @ Q  # already L2-normalized → dot == cosine
+
+    # Per-candidate "best matching anchor" for the why-label
+    if A.shape[0] > 1:
+        per_anchor = M @ A.T   # shape (N, len(anchors))
+        best_anchor_for_each = per_anchor.argmax(axis=1)
+    else:
+        best_anchor_for_each = _np.zeros(M.shape[0], dtype=int)
+
+    # ---- Phase 11.3: layer in the visual signal ---------------------------
+    # We hold a separate matrix for the visual-caption embeddings (gemini
+    # vision -> text -> gemini-embedding-2). At query time we project the
+    # anchors into the visual space too, compute a separate cosine, and
+    # blend at 0.65 text + 0.35 visual per candidate. Candidates not in
+    # the visual cache fall back to text-only — partial coverage degrades
+    # gracefully.
+    with _UV_CACHE_LOCK:
+        Vmat = _UV_CACHE.get("matrix")
+        Vids = _UV_CACHE.get("ids", [])
+        v_loaded = _UV_CACHE.get("loaded_at", 0)
+    if (Vmat is None or not Vids) or (time.time() - v_loaded > 600):
+        try:
+            _uv_cache_warm()
+        except Exception:
+            pass
+        with _UV_CACHE_LOCK:
+            Vmat = _UV_CACHE.get("matrix")
+            Vids = _UV_CACHE.get("ids", [])
+    visual_sim = None
+    visual_index = {}
+    if Vmat is not None and Vids:
+        visual_index = {vid: i for i, vid in enumerate(Vids)}
+        # Anchors that exist in the visual cache form the visual query vector.
+        v_anchor_idx = [visual_index[a] for a in anchors if a in visual_index]
+        if v_anchor_idx:
+            Vq = Vmat[v_anchor_idx].mean(axis=0)
+            vqn = float(_np.linalg.norm(Vq))
+            if vqn > 0:
+                Vq = Vq / vqn
+                # Compute per-candidate visual cosine, but candidates not in the
+                # visual cache get NaN so we can fall back to text-only later.
+                visual_sim_full = Vmat @ Vq      # for ids in Vmat
+                visual_sim = _np.full(M.shape[0], _np.nan, dtype=_np.float32)
+                for i, vid in enumerate(ids):
+                    j = visual_index.get(vid)
+                    if j is not None:
+                        visual_sim[i] = float(visual_sim_full[j])
+
+    if visual_sim is not None:
+        # Per-candidate blend: where visual is present, 0.65 text + 0.35 visual;
+        # otherwise just text.
+        has_visual = ~_np.isnan(visual_sim)
+        content_sim = _np.where(
+            has_visual,
+            0.65 * text_sim + 0.35 * _np.nan_to_num(visual_sim),
+            text_sim,
+        ).astype(_np.float32)
+    else:
+        content_sim = text_sim
+
+    # Pull metadata needed for freshness + popularity in one query.
+    placeholders = ",".join("?" for _ in ids)
+    rows = db.execute(
+        f"""SELECT v.video_id, v.created_at, v.views, v.likes, v.category
+              FROM videos v JOIN agents a ON v.agent_id = a.id
+             WHERE v.video_id IN ({placeholders})
+               AND COALESCE(v.is_removed, 0) = 0
+               AND COALESCE(a.is_banned, 0) = 0""",
+        ids,
+    ).fetchall()
+    meta = {r["video_id"]: dict(r) for r in rows}
+
+    n = len(ids)
+    freshness = _np.zeros(n, dtype=_np.float32)
+    popularity = _np.zeros(n, dtype=_np.float32)
+    cowatch = _np.zeros(n, dtype=_np.float32)
+    excluded_mask = _np.zeros(n, dtype=bool)
+
+    now = time.time()
+    excl = set(exclude_video_ids or [])
+    for vid in anchors:
+        excl.add(vid)
+    if category:
+        category = category.strip().lower()
+
+    # Co-watch: compute once per request from anchors.
+    cowatch_map = _feed_cowatch_scores(db, anchors)
+    cowatch_max = max(cowatch_map.values()) if cowatch_map else 0
+
+    for i, vid in enumerate(ids):
+        m = meta.get(vid)
+        if not m:
+            excluded_mask[i] = True
+            continue
+        if vid in excl:
+            excluded_mask[i] = True
+            continue
+        if category and (m.get("category") or "").lower() != category:
+            excluded_mask[i] = True
+            continue
+        age_days = max(0.0, (now - float(m["created_at"] or now)) / 86400.0)
+        freshness[i] = float(_np.exp(-age_days / 14.0))
+        v_views = float(m["views"] or 0) + 3.0 * float(m["likes"] or 0)
+        popularity[i] = min(1.0, _np.log1p(v_views) / 10.0)
+        if cowatch_max:
+            cowatch[i] = float(cowatch_map.get(vid, 0)) / float(cowatch_max)
+
+    # Final blend per Codex's spec, condensed for v1 (no transcript term):
+    #   0.45 content + 0.20 freshness + 0.15 co-watch + 0.10 popularity + 0.10 diversity.
+    # Diversity is applied below as an MMR-style re-ranking penalty so the
+    # scalar score above stays auditable; the diversity weight (0.10) is
+    # implicit in the re-rank, not added to the linear blend.
+    score = (
+        0.45 * content_sim
+        + 0.20 * freshness
+        + 0.15 * cowatch
+        + 0.10 * popularity
+    )
+    score[excluded_mask] = -10.0
+
+    # Take a wider initial slice so MMR diversity has candidates to choose from.
+    k_pool = max(per_page * 3, per_page + 10)
+    k_pool = max(1, min(k_pool, n))
+    pool_idx = _np.argpartition(-score, k_pool - 1)[:k_pool]
+    pool_idx = pool_idx[_np.argsort(-score[pool_idx])]
+
+    # MMR re-ranking: at each step pick the candidate maximizing
+    # 0.90 * relevance - 0.10 * max_similarity_to_already_selected.
+    selected = []
+    selected_idx_set = set()
+    pool_list = list(pool_idx)
+    while pool_list and len(selected) < per_page:
+        best_i = None
+        best_v = -1e9
+        for cand_i in pool_list:
+            if int(cand_i) in selected_idx_set:
+                continue
+            base = float(score[int(cand_i)])
+            penalty = 0.0
+            if selected:
+                # Cosine to most-similar already-selected → diversity penalty.
+                sel_M = M[[s for s in selected]]  # noqa: shape (len(selected), D)
+                sims_to_sel = sel_M @ M[int(cand_i)]
+                penalty = float(sims_to_sel.max())
+            mmr = 0.90 * base - 0.10 * penalty
+            if mmr > best_v:
+                best_v = mmr
+                best_i = int(cand_i)
+        if best_i is None:
+            break
+        selected.append(best_i)
+        selected_idx_set.add(best_i)
+        pool_list = [c for c in pool_list if int(c) != best_i]
+
+    top_idx = _np.array(selected, dtype=int) if selected else pool_idx[:per_page]
+
+    results = []
+    seen_anchor_titles = {}
+    if anchors:
+        anchor_titles_rows = db.execute(
+            f"""SELECT video_id, title FROM videos
+                 WHERE video_id IN ({",".join("?" for _ in anchors)})""",
+            anchors,
+        ).fetchall()
+        seen_anchor_titles = {r["video_id"]: r["title"] for r in anchor_titles_rows}
+
+    for i in top_idx:
+        i = int(i)
+        if score[i] <= -1.0:
+            continue
+        vid = ids[i]
+        # "Why" label: pick the dominant signal by weighted contribution.
+        c = float(content_sim[i])
+        t_only = float(text_sim[i])
+        v_only = (float(visual_sim[i]) if visual_sim is not None and not _np.isnan(visual_sim[i]) else None)
+        f = float(freshness[i])
+        p = float(popularity[i])
+        cw = float(cowatch[i])
+        contribs = [
+            (0.45 * c, "content"),
+            (0.20 * f, "freshness"),
+            (0.15 * cw, "cowatch"),
+            (0.10 * p, "popularity"),
+        ]
+        contribs.sort(key=lambda t: -t[0])
+        top_signal = contribs[0][1]
+        if top_signal == "content":
+            ai = int(best_anchor_for_each[i])
+            anchor_vid = anchors[ai] if ai < len(anchors) else ""
+            anchor_title = seen_anchor_titles.get(anchor_vid, "")
+            # If visual dominated within content, surface "Looks like" so
+            # the chip credits the right signal.
+            if v_only is not None and v_only > t_only and (v_only - t_only) > 0.03:
+                why = (f"Looks like \"{anchor_title[:55]}\"" if anchor_title
+                       else "Visual match")
+            elif anchor_title:
+                why = f"Like \"{anchor_title[:60]}\""
+            else:
+                why = "Topical match"
+        elif top_signal == "cowatch":
+            why = "Watched by viewers like you"
+        elif top_signal == "freshness":
+            why = "Just posted"
+        else:
+            why = "Trending now"
+        comp = {
+            "content_sim": round(c, 3),
+            "text_sim": round(t_only, 3),
+            "freshness": round(f, 3),
+            "cowatch": round(cw, 3),
+            "popularity": round(p, 3),
+        }
+        if v_only is not None:
+            comp["visual_sim"] = round(v_only, 3)
+        results.append((vid, float(score[i]), why, comp))
+        if len(results) >= per_page:
+            break
+    return results
+
+
+def _feed_log_impressions(bucket, video_ids):
+    """Append impressions to variant_impressions keyed by bucket.
+
+    Uses the existing thumbnail A/B table so the engineering page picks them
+    up automatically; the variant_key is the bucket name.
+    """
+    try:
+        if not video_ids:
+            return
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.executemany(
+            """INSERT INTO variant_impressions
+                   (video_id, variant_key, event_type, created_at)
+               VALUES (?, ?, 'feed_impression', ?)""",
+            [(vid, "feed:" + bucket, time.time()) for vid in video_ids],
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+# --- Phase 10.3: feed_impressions table for click + watch attribution ---
+
+_FEED_IMP_SCHEMA_READY = False
+_FEED_IMP_SCHEMA_LOCK = threading.Lock()
+
+
+def _feed_imp_ensure_schema():
+    """Lazy-create feed_impressions table per Codex Phase 10 spec."""
+    global _FEED_IMP_SCHEMA_READY
+    if _FEED_IMP_SCHEMA_READY:
+        return
+    with _FEED_IMP_SCHEMA_LOCK:
+        if _FEED_IMP_SCHEMA_READY:
+            return
+        conn = sqlite3.connect(str(DB_PATH))
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS feed_impressions (
+                    impression_id   TEXT PRIMARY KEY,
+                    visitor_id      TEXT DEFAULT '',
+                    surface         TEXT NOT NULL,        -- homepage_rail | feed_api | watch_upnext
+                    bucket          TEXT NOT NULL,        -- latest | heuristic | hybrid-v1 | personalized
+                    video_id        TEXT NOT NULL,
+                    position        INTEGER NOT NULL,     -- 0-indexed slot in the rendered list
+                    created_at      REAL NOT NULL,
+                    clicked_at      REAL DEFAULT 0,
+                    watch_seconds   REAL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_feed_imp_bucket_created
+                    ON feed_impressions(bucket, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_feed_imp_visitor
+                    ON feed_impressions(visitor_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_feed_imp_video
+                    ON feed_impressions(video_id, created_at DESC);
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        _FEED_IMP_SCHEMA_READY = True
+
+
+def _feed_imp_record(visitor_id, surface, bucket, videos):
+    """Mint impression IDs for a set of rendered cards. Returns list of ids."""
+    if not videos:
+        return []
+    _feed_imp_ensure_schema()
+    now = time.time()
+    rows = []
+    ids = []
+    for pos, vid in enumerate(videos):
+        imp_id = "imp_" + secrets.token_hex(8)
+        ids.append(imp_id)
+        rows.append((imp_id, visitor_id or "", surface, bucket, vid, pos, now))
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.executemany(
+            """INSERT INTO feed_impressions
+                   (impression_id, visitor_id, surface, bucket, video_id, position, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+    return ids
+
+
+@app.route("/api/feed/click", methods=["POST"])
+def api_feed_click():
+    """Record a click on a feed impression."""
+    _feed_imp_ensure_schema()
+    data = request.get_json(silent=True) or {}
+    imp_id = (data.get("imp") or data.get("impression_id") or "").strip()
+    if not re.fullmatch(r"imp_[a-f0-9]{8,32}", imp_id):
+        return jsonify({"ok": False, "error": "invalid impression_id"}), 400
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.execute(
+            """UPDATE feed_impressions
+                  SET clicked_at = ?
+                WHERE impression_id = ?
+                  AND clicked_at = 0""",
+            (time.time(), imp_id),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True})
+
+
+@app.route("/api/feed/watch", methods=["POST"])
+def api_feed_watch():
+    """Record a watch-seconds ping for a feed impression. Idempotent in MAX-direction."""
+    _feed_imp_ensure_schema()
+    data = request.get_json(silent=True) or {}
+    imp_id = (data.get("imp") or data.get("impression_id") or "").strip()
+    try:
+        seconds = max(0.0, min(86400.0, float(data.get("seconds", 0))))
+    except Exception:
+        return jsonify({"ok": False, "error": "seconds must be a number"}), 400
+    if not re.fullmatch(r"imp_[a-f0-9]{8,32}", imp_id):
+        return jsonify({"ok": False, "error": "invalid impression_id"}), 400
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.execute(
+            """UPDATE feed_impressions
+                  SET watch_seconds = MAX(COALESCE(watch_seconds, 0), ?)
+                WHERE impression_id = ?""",
+            (seconds, imp_id),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True})
+
+
+def _feed_imp_outcomes(window_hours=168):
+    """Compute per-bucket CTR and mean-watch-seconds over the last window."""
+    _feed_imp_ensure_schema()
+    cutoff = time.time() - window_hours * 3600
+    out = {}
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """SELECT bucket,
+                      COUNT(*) AS impressions,
+                      SUM(CASE WHEN clicked_at > 0 THEN 1 ELSE 0 END) AS clicks,
+                      AVG(CASE WHEN clicked_at > 0 AND watch_seconds > 0
+                               THEN watch_seconds ELSE NULL END) AS mean_watch
+                 FROM feed_impressions
+                WHERE created_at > ?
+                GROUP BY bucket
+                ORDER BY impressions DESC""",
+            (cutoff,),
+        ).fetchall()
+        conn.close()
+        for r in rows:
+            imps = int(r["impressions"] or 0)
+            clicks = int(r["clicks"] or 0)
+            ctr = (clicks / imps) if imps else 0.0
+            out[r["bucket"]] = {
+                "impressions": imps,
+                "clicks": clicks,
+                "ctr": round(ctr, 4),
+                "mean_watch_s": round(float(r["mean_watch"] or 0), 1),
+            }
+    except Exception:
+        pass
+    return out
+
+
 @app.route("/api/feed")
 def feed():
     """Get feed of recent videos with optional recommendation mode.
-    
+
     Query parameters:
         - page: Page number (default 1)
         - per_page: Items per page (default 20, max 50)
         - mode: "latest" (deterministic, default) or "recommended" (ML scoring)
         - category: Filter by category (optional)
-    
+        - bucket: "auto" (default — visitor-hash assigns), "latest",
+                  "heuristic", or "hybrid-v1" (forces a specific bucket).
+
     Returns:
-        JSON with videos list, page info, and mode used.
+        JSON with videos list, page info, mode used, and the active bucket.
     """
     page = max(1, request.args.get("page", 1, type=int))
     per_page = min(50, max(1, request.args.get("per_page", 20, type=int)))
     mode = request.args.get("mode", "latest")
     category = request.args.get("category")
-    
+    bucket_override = (request.args.get("bucket") or "").strip().lower()
+
     # Get optional API key for personalized recommendations
     api_key = request.headers.get("X-API-Key") or request.args.get("api_key")
     agent_id = None
@@ -7986,7 +9080,145 @@ def feed():
         ).fetchone()
         if agent:
             agent_id = agent["id"]
-    
+
+    # Bucket assignment via deterministic visitor_id hash.
+    visitor_id = getattr(g, "visitor_id", "") or request.cookies.get("_bt_vid", "")
+    bucket = _feed_bucket_for_visitor(visitor_id, override=bucket_override)
+
+    # Hybrid bucket: embedding-based ranking. First page only — subsequent
+    # pages fall back to chronological, since hybrid is an entry-point feed
+    # rather than an infinite scroll target.
+    if bucket == "hybrid-v1" and page == 1:
+        db = get_db()
+        viewer_ip = _get_client_ip()
+        ranked = _feed_hybrid_v1(
+            db, viewer_agent_id=agent_id, viewer_ip=viewer_ip,
+            per_page=per_page, category=category,
+        )
+        if ranked:
+            placeholders = ",".join("?" for _ in ranked)
+            rows = db.execute(
+                f"""SELECT v.*, a.agent_name, a.display_name, a.avatar_url, a.is_human
+                      FROM videos v JOIN agents a ON v.agent_id = a.id
+                     WHERE v.video_id IN ({placeholders})""",
+                [vid for vid, _, _, _ in ranked],
+            ).fetchall()
+            row_by_id = {r["video_id"]: r for r in rows}
+            videos = []
+            for vid, score, why, components in ranked:
+                row = row_by_id.get(vid)
+                if not row:
+                    continue
+                d = video_to_dict(row)
+                d["agent_name"] = row["agent_name"]
+                d["display_name"] = row["display_name"]
+                d["avatar_url"] = row["avatar_url"]
+                d["_why"] = why
+                d["_score"] = round(score, 4)
+                d["_components"] = components
+                videos.append(d)
+            try:
+                _feed_log_impressions("hybrid-v1", [v["video_id"] for v in videos])
+            except Exception:
+                pass
+            try:
+                imp_ids = _feed_imp_record(
+                    visitor_id=visitor_id,
+                    surface=request.args.get("surface", "feed_api"),
+                    bucket="hybrid-v1",
+                    videos=[v["video_id"] for v in videos],
+                )
+                for v, imp_id in zip(videos, imp_ids):
+                    v["_imp"] = imp_id
+            except Exception:
+                pass
+            return jsonify({
+                "videos": videos,
+                "page": page,
+                "mode": "hybrid-v1",
+                "bucket": "hybrid-v1",
+                "explanation": (
+                    "Embedding-based ranking — content similarity to your "
+                    "recent watches (or trending if anonymous), weighted with "
+                    "freshness and popularity."
+                ),
+            })
+        # Fall through to heuristic/latest if cache not warm yet
+
+    # Heuristic bucket: a popularity-only ranker (independent of viewer
+    # identity). Codex called the previous fallback-to-latest behavior
+    # "credibility debt" — this turns it into a real second arm:
+    #
+    #   score = log1p(views) + 3 * log1p(likes) - 2 * log1p(dislikes)
+    #
+    # Slight age decay (multiply by exp(-age_days/60)) so the top of the
+    # rail isn't permanently dominated by ancient hits. No personal
+    # history, no agent_id required, deterministic across viewers.
+    if bucket == "heuristic" and page == 1:
+        db = get_db()
+        try:
+            cat_clause = "AND v.category = ?" if category else ""
+            params = [category] if category else []
+            params.append(per_page * 4)
+            rows = db.execute(
+                f"""SELECT v.*, a.agent_name, a.display_name, a.avatar_url, a.is_human
+                      FROM videos v JOIN agents a ON v.agent_id = a.id
+                     WHERE COALESCE(v.is_removed, 0) = 0
+                       AND COALESCE(a.is_banned, 0) = 0
+                       {cat_clause}
+                     ORDER BY v.created_at DESC
+                     LIMIT ?""",
+                params,
+            ).fetchall()
+            now = time.time()
+            scored = []
+            for r in rows:
+                age_days = max(0.0, (now - float(r["created_at"] or now)) / 86400.0)
+                views = float(r["views"] or 0)
+                likes = float(r["likes"] or 0)
+                dislikes = float(r["dislikes"] or 0)
+                pop = math.log1p(views) + 3.0 * math.log1p(likes) - 2.0 * math.log1p(dislikes)
+                age_decay = math.exp(-age_days / 60.0)
+                scored.append((pop * age_decay, r))
+            scored.sort(key=lambda t: -t[0])
+            result_videos = []
+            for score, r in scored[:per_page]:
+                d = video_to_dict(r)
+                d["agent_name"] = r["agent_name"]
+                d["display_name"] = r["display_name"]
+                d["avatar_url"] = r["avatar_url"]
+                d["_why"] = "Trending"
+                d["_score"] = round(float(score), 4)
+                result_videos.append(d)
+            try:
+                _feed_log_impressions("heuristic", [d["video_id"] for d in result_videos if d.get("video_id")])
+            except Exception:
+                pass
+            try:
+                imp_ids = _feed_imp_record(
+                    visitor_id=visitor_id,
+                    surface=request.args.get("surface", "feed_api"),
+                    bucket="heuristic",
+                    videos=[d["video_id"] for d in result_videos if d.get("video_id")],
+                )
+                for v, imp_id in zip(result_videos, imp_ids):
+                    v["_imp"] = imp_id
+            except Exception:
+                pass
+            return jsonify({
+                "videos": result_videos,
+                "page": page,
+                "mode": "heuristic",
+                "bucket": "heuristic",
+                "explanation": (
+                    "Popularity-only ranker — log-views + likes - dislikes, "
+                    "with mild 60-day age decay. No personal history."
+                ),
+            })
+        except Exception as _h_e:
+            app.logger.warning("heuristic feed failed, falling back to latest: %s", _h_e)
+            # fall through to recommended/latest paths
+
     # Use recommendation engine for recommended mode
     if mode == "recommended":
         from recommendation_engine import get_feed_recommendations
@@ -8007,11 +9239,17 @@ def feed():
             d["display_name"] = v.get("display_name", "")
             d["avatar_url"] = v.get("avatar_url", "")
             d["recommend_score"] = v.get("recommend_score", 0)
+            d["_why"] = "Personalized"
             result_videos.append(d)
+        try:
+            _feed_log_impressions("personalized", [d["video_id"] for d in result_videos if d.get("video_id")])
+        except Exception:
+            pass
         return jsonify({
             "videos": result_videos,
             "page": page,
-            "mode": actual_mode
+            "mode": actual_mode,
+            "bucket": "personalized",
         })
     
     # Default: latest mode (deterministic fallback)
@@ -8046,9 +9284,39 @@ def feed():
         d["agent_name"] = row["agent_name"]
         d["display_name"] = row["display_name"]
         d["avatar_url"] = row["avatar_url"]
+        d["_why"] = "Newest upload"
         videos.append(d)
 
-    return jsonify({"videos": videos, "page": page, "mode": "latest"})
+    # CTR: Record impressions for videos shown in feed
+    try:
+        vid_ids = [v.get("video_id", "") for v in videos if v.get("video_id")]
+        if vid_ids:
+            _get_ctr_tracker().record_impressions_batch(vid_ids)
+    except Exception:
+        pass  # CTR tracking is best-effort
+
+    try:
+        _feed_log_impressions("latest", [v["video_id"] for v in videos if v.get("video_id")])
+    except Exception:
+        pass
+    try:
+        imp_ids = _feed_imp_record(
+            visitor_id=visitor_id,
+            surface=request.args.get("surface", "feed_api"),
+            bucket=bucket if bucket in _FEED_BUCKETS else "latest",
+            videos=[v["video_id"] for v in videos if v.get("video_id")],
+        )
+        for v, imp_id in zip(videos, imp_ids):
+            v["_imp"] = imp_id
+    except Exception:
+        pass
+
+    return jsonify({
+        "videos": videos,
+        "page": page,
+        "mode": "latest",
+        "bucket": bucket,
+    })
 
 
 @app.route("/api/challenges")
@@ -8322,10 +9590,15 @@ def platform_stats():
 def update_profile():
     """Update your agent profile (bio, display_name, avatar_url)."""
     data = request.get_json(silent=True) or {}
-    ALLOWED = {"display_name", "bio", "avatar_url"}
+    ALLOWED = {"display_name", "bio", "avatar_url", "banner_url", "accent_color", "pinned_video_id"}
+    # Fields that contain user-visible text and need script tag sanitization
+    _TEXT_FIELDS = {"display_name", "bio"}
     updates = {k: v for k, v in data.items() if k in ALLOWED and isinstance(v, str)}
     if not updates:
         return jsonify({"error": "Provide at least one field: display_name, bio, avatar_url"}), 400
+    for field in _TEXT_FIELDS:
+        if field in updates:
+            updates[field] = _strip_script_tags(updates[field])
 
     # Validate lengths
     if "display_name" in updates and len(updates["display_name"]) > 50:
@@ -10313,6 +11586,26 @@ def watch(video_id):
         (video_id,),
     ).fetchall()
 
+    # Response video handling (Issue #2282 - Agent Collab System)
+    # Get the original video this is responding to
+    response_to_video = None
+    if "response_to_video_id" in video.keys() and video["response_to_video_id"]:
+        response_to_video = db.execute(
+            """SELECT v.video_id, v.title, v.views, v.created_at, a.agent_name, a.display_name, a.avatar_url
+               FROM videos v JOIN agents a ON v.agent_id = a.id
+               WHERE v.video_id = ?""",
+            (video["response_to_video_id"],),
+        ).fetchone()
+
+    # Get all response videos to this video
+    response_videos = db.execute(
+        """SELECT v.video_id, v.title, v.views, v.created_at, a.agent_name, a.display_name, a.avatar_url
+           FROM videos v JOIN agents a ON v.agent_id = a.id
+           WHERE v.response_to_video_id = ? AND v.is_removed = 0
+           ORDER BY v.created_at DESC LIMIT 10""",
+        (video_id,),
+    ).fetchall()
+
     challenge = None
     if "challenge_id" in video.keys() and video["challenge_id"]:
         challenge = db.execute(
@@ -10421,6 +11714,57 @@ def watch(video_id):
             user_vote = _uv["vote"]
     creator_badges = _list_agent_badges(db, int(video["agent_id"]))
 
+    # Agent interaction data for watch page
+    _vid_aid = int(video["agent_id"])
+    try:
+        interaction_commenters = db.execute(
+            "SELECT a2.agent_name, a2.display_name, a2.avatar_url, COUNT(*) AS cnt"
+            " FROM comments c JOIN videos v ON c.video_id = v.video_id"
+            " JOIN agents a2 ON c.agent_id = a2.id"
+            " WHERE v.agent_id = ? AND c.agent_id != ?"
+            " GROUP BY a2.id ORDER BY cnt DESC LIMIT 8",
+            (_vid_aid, _vid_aid)).fetchall()
+        interaction_likers = db.execute(
+            "SELECT a2.agent_name, a2.display_name, a2.avatar_url, COUNT(*) AS cnt"
+            " FROM votes vt JOIN videos v ON vt.video_id = v.video_id"
+            " JOIN agents a2 ON vt.agent_id = a2.id"
+            " WHERE v.agent_id = ? AND vt.vote = 1 AND vt.agent_id != ?"
+            " GROUP BY a2.id ORDER BY cnt DESC LIMIT 8",
+            (_vid_aid, _vid_aid)).fetchall()
+        interaction_outgoing = []
+    except Exception:
+        interaction_commenters = []
+        interaction_likers = []
+        interaction_outgoing = []
+
+    # Phase 11.28: pull provenance fields for OG metadata so the
+    # manifest_hash + chain anchor are visible to social-media scrapers
+    # and bots even before the page-level JS fires.
+    prov_meta = {}
+    try:
+        pr = db.execute(
+            """SELECT COALESCE(anchor_tx_hash, '') AS tx,
+                      COALESCE(anchor_block_height, 0) AS h,
+                      COALESCE(anchor_manifest_hash, '') AS root,
+                      COALESCE(anchor_chain, '') AS chain,
+                      COALESCE(canonical_sha256, '') AS canonical,
+                      COALESCE(manifest_version, 1) AS v
+                 FROM video_provenance WHERE video_id = ?""",
+            (video_id,),
+        ).fetchone()
+        if pr:
+            prov_meta = {
+                "tx_hash": pr["tx"],
+                "block_height": int(pr["h"] or 0),
+                "manifest_hash": pr["root"],
+                "chain": pr["chain"],
+                "canonical_sha256": pr["canonical"],
+                "manifest_version": int(pr["v"] or 1),
+                "verified": bool(pr["tx"] and pr["h"]),
+            }
+    except Exception:
+        prov_meta = {}
+
     return render_template(
         "watch.html",
         video=video,
@@ -10441,8 +11785,11 @@ def watch(video_id):
         interaction_outgoing=interaction_outgoing,
         revision_of=revision_of,
         revisions=revisions,
+        response_to_video=response_to_video,
+        response_videos=response_videos,
         challenge=challenge,
         creator_ban_address=creator_ban_address,
+        prov_meta=prov_meta,
     )
 
 
@@ -10511,7 +11858,7 @@ def oembed():
         return jsonify({"error": "Unsupported format. Use json or xml."}), 501
 
     # Extract video_id from URL
-    match = re.search(r"/watch/([A-Za-z0-9_-]{11})", url)
+    match = re.search(r"/watch/([A-Za-z0-9_-]{5,20})", url)
     if not match:
         return jsonify({"error": "Invalid URL"}), 404
 
@@ -10524,6 +11871,8 @@ def oembed():
 
     if not video:
         return jsonify({"error": "Video not found"}), 404
+
+    video = dict(video)  # Convert sqlite3.Row to dict for .get() support
 
     w = request.args.get("maxwidth", video["width"] or 512, type=int)
     h = request.args.get("maxheight", video["height"] or 512, type=int)
@@ -10687,9 +12036,25 @@ def channel(agent_name):
            ORDER BY comments_given + likes_given DESC LIMIT 8""",
         (aid, aid, aid, aid, aid)).fetchall()
 
+    # Extract customization from agent (sqlite3.Row uses bracket access)
+    agent_dict = dict(agent)
+    customization = {
+        "banner_url": agent_dict.get("banner_url", ""),
+        "theme_accent_color": agent_dict.get("accent_color", ""),
+        "theme_primary_color": "",
+        "theme_background_dark": 1
+    }
+    pinned_videos = []
+    if agent_dict.get("pinned_video_id"):
+        pinned = [v for v in videos if v["video_id"] == agent["pinned_video_id"]]
+        if pinned:
+            pinned_videos = pinned
+
     return render_template(
         "channel.html",
         agent=agent,
+        customization=customization,
+        pinned_videos=pinned_videos,
         agent_badges=agent_badges,
         videos=videos,
         total_views=total_views,
@@ -10722,6 +12087,16 @@ def docs_page():
 
 # ── Blog routes ──────────────────────────────────────────────────────
 BLOG_POSTS = [
+    {
+        "slug": "bottube-gpt-agent",
+        "template": "blog_gpt_agent.html",
+        "title": "BoTTube Agent is Now on the ChatGPT GPT Store",
+        "description": "Search trending AI videos, generate content, verify agent identities, and explore the full Elyan Labs ecosystem — all from inside ChatGPT.",
+        "author": "Scott Boudreaux",
+        "date": "2026-03-25",
+        "pub_rfc": "Tue, 25 Mar 2026 18:00:00 +0000",
+        "tags": ["GPT Store", "ChatGPT", "AI Agents", "Video Generation"],
+    },
     {
         "slug": "beacon-certified-open-source",
         "template": "blog_beacon_certified_oss.html",
@@ -11958,10 +13333,10 @@ if not ADMIN_KEY:
 
 @app.route("/api/admin/visitors")
 def admin_visitors():
-    """View visitor analytics. Requires admin key via header."""
-    provided = request.headers.get("X-Admin-Key", "") or request.args.get("key", "")
-    if not provided or provided != ADMIN_KEY:
-        abort(403)
+    """View visitor analytics. Requires admin key via X-Admin-Key header."""
+    err = _require_admin()
+    if err:
+        return err
 
     hours = min(168, max(1, request.args.get("hours", 24, type=int)))
     cutoff = time.time() - hours * 3600
@@ -12028,13 +13403,14 @@ def admin_duplicate_comments():
     Keeps the OLDEST comment (lowest id), removes newer copies.
 
     Query params:
-        key       - admin key (required)
         dry_run   - if "0", actually delete; default is dry-run
         window_h  - only check comments from last N hours (default: all)
+    Headers:
+        X-Admin-Key - admin key (required)
     """
-    provided = request.headers.get("X-Admin-Key", "") or request.args.get("key", "")
-    if not provided or provided != ADMIN_KEY:
-        abort(403)
+    err = _require_admin()
+    if err:
+        return err
 
     dry_run = request.args.get("dry_run", "1") != "0"
     window_h = request.args.get("window_h", 0, type=int)
@@ -12105,14 +13481,15 @@ def admin_comment_cleanup():
     """Full comment cleanup: coach/hold duplicates + optionally prune bot spam.
 
     POST JSON:
-        key          - admin key (required)
         remove_dupes - inspect exact duplicates (default true)
         max_similar  - max near-identical comments per agent per video (default 3)
         force_remove - when true, actually delete duplicate/excess comments
+    Headers:
+        X-Admin-Key  - admin key (required)
     """
-    provided = request.headers.get("X-Admin-Key", "") or request.args.get("key", "")
-    if not provided or provided != ADMIN_KEY:
-        abort(403)
+    err = _require_admin()
+    if err:
+        return err
 
     data = request.get_json(silent=True) or {}
     remove_dupes = data.get("remove_dupes", True)
@@ -12347,9 +13724,27 @@ def global_rss():
 
 
 # ---------------------------------------------------------------------------
+# Analytics Dashboard (Creator Analytics - Issue #423)
+# ---------------------------------------------------------------------------
+from analytics_blueprint import analytics_bp
+app.register_blueprint(analytics_bp)
+
+# ---------------------------------------------------------------------------
+# Search & Discoverability (Video Discovery - Issue #425)
+# ---------------------------------------------------------------------------
+from search_blueprint import search_bp
+app.register_blueprint(search_bp)
+
+# ---------------------------------------------------------------------------
+# Agent Interaction Visibility (Social Features - Issue #424)
+# ---------------------------------------------------------------------------
+from interactions_blueprint import interactions_bp
+app.register_blueprint(interactions_bp)
+
+# ---------------------------------------------------------------------------
 # SEO & Crawler Routes (robots.txt, sitemap.xml)
 # ---------------------------------------------------------------------------
-from seo_routes import seo_bp
+from seo_routes import seo_bp, get_organization_jsonld, get_website_jsonld, get_faqpage_jsonld
 app.register_blueprint(seo_bp)
 
 # ---------------------------------------------------------------------------
@@ -12357,6 +13752,18 @@ app.register_blueprint(seo_bp)
 # ---------------------------------------------------------------------------
 from api_docs import docs_bp
 app.register_blueprint(docs_bp)
+
+# ---------------------------------------------------------------------------
+# Agent Discovery (A2A, ChatGPT, OpenAPI JSON, universal /api/discover)
+# ---------------------------------------------------------------------------
+from agent_discovery import discovery_bp
+app.register_blueprint(discovery_bp)
+
+# ---------------------------------------------------------------------------
+# Video Generation (Text-to-Video API for GPT Actions)
+# ---------------------------------------------------------------------------
+from video_gen_blueprint import video_gen_bp
+app.register_blueprint(video_gen_bp)
 
 # ---------------------------------------------------------------------------
 # GPU Marketplace (Decentralized AI Rendering)
@@ -12411,6 +13818,18 @@ try:
 except ImportError:
     # Optional module; keep core server + docs usable in minimal deployments.
     X402_ENABLED = False
+
+# ---------------------------------------------------------------------------
+# RTC Service Gateway — Pay RTC for real services (utility before liquidity)
+# ---------------------------------------------------------------------------
+try:
+    import rtc_services
+    rtc_services.init_app(app, DB_PATH)
+    RTC_SERVICES_ENABLED = True
+    print("RTC Services gateway enabled — /api/rtc/services, /services")
+except Exception as e:
+    RTC_SERVICES_ENABLED = False
+    print(f"RTC Services not loaded: {e}")
 
 # ---------------------------------------------------------------------------
 # Google Indexing API (alongside IndexNow)
@@ -12479,6 +13898,14 @@ except ImportError:
 from news_routes import news_bp
 app.register_blueprint(news_bp)
 
+# Bounty #1102 fix: translation_bp was defined in translation_routes.py but never
+# registered, so /translations and /api/languages returned 404. Register fail-safe.
+try:
+    from translation_routes import translation_bp
+    app.register_blueprint(translation_bp)
+except Exception as _tx_e:
+    print(f"[BoTTube] translation_bp registration skipped: {_tx_e}")
+
 # ---------------------------------------------------------------------------
 # Syndication Run Tracking & Reporting (Issue #312)
 # ---------------------------------------------------------------------------
@@ -12488,6 +13915,21 @@ try:
     app.register_blueprint(syndication_bp)
 except Exception as e:
     print(f"[WARN] Syndication routes not loaded: {e}")
+
+# Agent Beef System (Organic Rivalries - Bounty #2287)
+from agent_relationships import beef_bp, init_beef_tables
+init_beef_tables()
+app.register_blueprint(beef_bp)
+
+# --- AVAP (Agent Video Attestation Protocol) — additive, fail-safe ---
+try:
+    from avap_blueprint import avap_bp, init_avap_tables
+    init_avap_tables()
+    app.register_blueprint(avap_bp)
+    print('[avap] registered AVAP blueprint')
+except Exception as _avap_e:
+    print(f'[avap] NOT registered: {_avap_e}')
+
 
 # ---------------------------------------------------------------------------
 # Push Notification Subscriptions (FCM / Web Push)
@@ -12533,8 +13975,16 @@ def push_unsubscribe():
 
 
 def _require_admin():
-    """Check admin key from header or query param. Returns None if OK, or error response."""
-    provided = request.headers.get("X-Admin-Key", "") or request.args.get("key", "")
+    """Check admin key via X-Admin-Key header (preferred).
+
+    Query-param ``?key=`` still accepted for backward compat but logs a
+    deprecation warning -- secrets in URLs leak into logs/history/referers.
+    """
+    provided = request.headers.get("X-Admin-Key", "")
+    if not provided:
+        provided = request.args.get("key", "")
+        if provided:
+            print(f"[BoTTube] DEPRECATION WARNING: admin key via query param on {request.path} -- use X-Admin-Key header")
     if not provided or provided != ADMIN_KEY:
         return jsonify({"error": "Forbidden"}), 403
     return None
@@ -12993,10 +14443,10 @@ def admin_monitoring_api():
 
 @app.route("/monitoring")
 def monitoring_dashboard():
-    """Self-contained monitoring dashboard page. Requires admin key in URL."""
-    provided = request.args.get("key", "")
-    if not provided or provided != ADMIN_KEY:
-        return "Forbidden — append ?key=YOUR_ADMIN_KEY", 403
+    """Self-contained monitoring dashboard page. Requires admin key via X-Admin-Key header."""
+    err = _require_admin()
+    if err:
+        return err
 
     return """<!DOCTYPE html>
 <html lang="en">
@@ -13071,6 +14521,8 @@ function renderBars(data, maxBars) {
   return `<div class="chart-bar">${bars}</div><div class="chart-label"><span>${data.length > maxBars ? (data.length-maxBars)+'h ago' : '48h ago'}</span><span>now</span></div>`;
 }
 
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
 async function refresh() {
   try {
     const r = await fetch('/api/admin/monitoring?key=' + KEY);
@@ -13099,15 +14551,15 @@ async function refresh() {
     // Banned
     html += `<div class="card"><h2>Banned Agents <span class="badge red">${d.banned_agents.length}</span></h2>`;
     if (d.banned_agents.length === 0) html += `<div class="sub-num">None</div>`;
-    else d.banned_agents.forEach(b => { html += `<div class="stat-row"><span class="stat-label">${b.name}</span><span class="stat-value" style="color:#f85149">${b.reason||'—'}</span></div>`; });
+    else d.banned_agents.forEach(b => { html += `<div class="stat-row"><span class="stat-label">${esc(b.name)}</span><span class="stat-value" style="color:#f85149">${esc(b.reason||'—')}</span></div>`; });
     html += `</div>`;
 
     // Active agents
     html += `<div class="card wide"><h2>Most Active (7 days)</h2>`;
     d.active_agents.forEach(a => {
       const typ = a.is_human ? 'human' : 'ai';
-      html += `<div class="agent-row"><span class="agent-name">${a.display_name} <span style="color:#484f58">@${a.agent_name}</span></span>`;
-      html += `<span class="agent-type ${typ}">${typ.toUpperCase()}</span>`;
+      html += `<div class="agent-row"><span class="agent-name">${esc(a.display_name)} <span style="color:#484f58">@${esc(a.agent_name)}</span></span>`;
+      html += `<span class="agent-type ${esc(typ)}">${typ.toUpperCase()}</span>`;
       html += `<span class="badge blue">${a.videos_7d}v</span>`;
       html += `<span class="badge green">${a.comments_7d}c</span>`;
       html += `<span style="color:#484f58;font-size:12px">${ago(a.last_action)}</span></div>`;
@@ -13118,7 +14570,7 @@ async function refresh() {
     html += `<div class="card wide"><h2>Trending Today</h2>`;
     if (d.trending_videos.length === 0) html += `<div class="sub-num">No videos today</div>`;
     else d.trending_videos.forEach(v => {
-      html += `<div class="video-row"><div class="video-title">${v.title}</div><div class="video-meta">by ${v.display_name} — ${fmt(v.views)} views, ${v.likes} likes</div></div>`;
+      html += `<div class="video-row"><div class="video-title">${esc(v.title)}</div><div class="video-meta">by ${esc(v.display_name)} — ${fmt(v.views)} views, ${v.likes} likes</div></div>`;
     });
     html += `</div>`;
 
@@ -13362,7 +14814,7 @@ def npm_downloads():
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read())
             _npm_cache["count"] = data.get("downloads", _npm_cache["count"])
-            _npm_cache["ts"] = now
+            _npm_cache["ts"] = time.time()
     except Exception:
         pass
     return jsonify({"downloads": _npm_cache["count"]})
@@ -13389,7 +14841,7 @@ def pypi_downloads():
             total = sum(r.get("downloads", 0) for r in rows if r.get("category") == "with_mirrors")
             if total > 0:
                 _pypi_cache["count"] = total
-                _pypi_cache["ts"] = now
+                _pypi_cache["ts"] = time.time()
     except Exception:
         pass
     return jsonify({"downloads": _pypi_cache["count"]})
@@ -14520,7 +15972,7 @@ def admin_resolve_report(report_id):
 
 def build_breadcrumb_jsonld(items):
     """Build BreadcrumbList JSON-LD from a list of (name, url) tuples."""
-    return Markup(json.dumps({
+    return Markup(safe_jsonld({
         "@context": "https://schema.org",
         "@type": "BreadcrumbList",
         "itemListElement": [
@@ -14535,17 +15987,24 @@ def build_breadcrumb_jsonld(items):
     }))
 
 app.jinja_env.globals["build_breadcrumb_jsonld"] = build_breadcrumb_jsonld
-app.jinja_env.globals["json_dumps"] = lambda x: Markup(json.dumps(x))
+app.jinja_env.globals["get_organization_jsonld"] = get_organization_jsonld
+app.jinja_env.globals["get_website_jsonld"] = get_website_jsonld
+app.jinja_env.globals["get_faqpage_jsonld"] = get_faqpage_jsonld
+app.jinja_env.globals["json_dumps"] = lambda x: Markup(safe_jsonld(x))
 
 def jsonld_safe(value):
     """Escape a string for safe use inside a JSON-LD string value.
     Handles newlines, tabs, backslashes, quotes — everything json.dumps does,
-    but returns only the inner string (no outer quotes)."""
+    but returns only the inner string (no outer quotes).
+    Also prevents </script> breakout via <\\/ escaping."""
     if value is None:
         return ''
     s = str(value)
     # json.dumps adds outer quotes; strip them to get the escaped interior
-    return Markup(json.dumps(s)[1:-1])
+    inner = json.dumps(s)[1:-1]
+    # Prevent </script> injection when embedded in <script> blocks
+    inner = inner.replace("</", "<\\/")
+    return Markup(inner)
 
 app.jinja_env.filters["jsonld_safe"] = jsonld_safe
 
@@ -14665,6 +16124,224 @@ def seen_on_bottube_badge():
 
 
 # ---------------------------------------------------------------------------
+# Phase 11.18: per-video verification badges
+# ---------------------------------------------------------------------------
+# Three artifacts so creators can broadcast on-chain provenance from their
+# own sites without bottube cooperation beyond serving public read-only
+# endpoints:
+#   1. /badge/verified/<video_id>.svg   — pure SVG, drop-in <img src>
+#   2. /embed/verify/<video_id>         — sandboxable HTML iframe widget
+#   3. /static/bottube-verify.js        — cross-origin JS that turns
+#       <div data-bottube-verify="<id>"> into a live pill on any page
+#
+# All three read the same /api/videos/<id>/provenance payload, so the
+# verification status they show is canonical — no separate code path
+# that could drift.
+
+def _verify_badge_svg(state, label, value, color, value_color="#fff"):
+    """Render a shields.io-style 2-tone badge for the verified state."""
+    # Width math: 6px/char (Verdana) + 12px padding per side per panel
+    pad = 10
+    label_w = max(70, len(label) * 6 + pad * 2)
+    value_w = max(80, len(value) * 6 + pad * 2)
+    total_w = label_w + value_w
+    # Truncate value if absurdly long (e.g. raw tx_hash)
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{total_w}" '
+        f'height="22" role="img" aria-label="{label}: {value}">'
+        f'<title>{label}: {value}</title>'
+        f'<linearGradient id="gloss" x2="0" y2="100%">'
+        f'<stop offset="0" stop-color="#fff" stop-opacity=".15"/>'
+        f'<stop offset="1" stop-opacity=".25"/></linearGradient>'
+        f'<rect width="{total_w}" height="22" rx="3" fill="#222"/>'
+        f'<rect x="{label_w}" width="{value_w}" height="22" rx="3" fill="{color}"/>'
+        f'<rect x="{label_w-2}" width="4" height="22" fill="{color}"/>'
+        f'<rect width="{total_w}" height="22" rx="3" fill="url(#gloss)"/>'
+        f'<g fill="#fff" font-family="Verdana,Geneva,DejaVu Sans,sans-serif" '
+        f'font-size="11" text-rendering="geometricPrecision">'
+        f'<text x="{label_w//2}" y="15" fill="#000" fill-opacity=".25" '
+        f'text-anchor="middle">{label}</text>'
+        f'<text x="{label_w//2}" y="14" text-anchor="middle">{label}</text>'
+        f'<text x="{label_w + value_w//2}" y="15" fill="#000" fill-opacity=".25" '
+        f'text-anchor="middle">{value}</text>'
+        f'<text x="{label_w + value_w//2}" y="14" text-anchor="middle" '
+        f'fill="{value_color}">{value}</text>'
+        f'</g></svg>'
+    )
+
+
+def _verify_state_for_video(video_id):
+    """Look up the verification state for one video. Returns
+    (state, value_text, anchor_tx, manifest_version) where state is one of
+    'verified', 'pending', 'failed', 'unknown'.
+
+    Read-only, side-effect-free. Cached at the HTTP layer (the badge route
+    sets Cache-Control: public, max-age=300).
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_-]{5,32}", video_id or ""):
+        return "unknown", "invalid id", "", 1
+    try:
+        _provenance_ensure_v2_columns()
+    except Exception:
+        pass
+    db = get_db()
+    try:
+        row = db.execute(
+            """SELECT COALESCE(anchor_tx_hash,'') AS tx,
+                      COALESCE(anchor_block_height,0) AS h,
+                      COALESCE(anchor_status,'pending') AS status,
+                      COALESCE(anchor_chain,'') AS chain,
+                      COALESCE(uploader_sig,'') AS sig,
+                      COALESCE(manifest_version,1) AS v
+                 FROM video_provenance
+                WHERE video_id = ?""",
+            (video_id,),
+        ).fetchone()
+    except Exception:
+        return "unknown", "no provenance", "", 1
+    if not row:
+        return "unknown", "no provenance", "", 1
+
+    tx = row["tx"]
+    h = int(row["h"] or 0)
+    v = int(row["v"] or 1)
+    if not tx:
+        return "pending", "pending", "", v
+    if not h or row["chain"] == "stub":
+        return "pending", "broadcasting", tx, v
+    return "verified", f"block {h} · v{v}", tx, v
+
+
+@app.route("/badge/verified/<video_id>.svg")
+def badge_verified_svg(video_id):
+    """Per-video provenance badge.
+
+    Returns a 2-tone SVG ("verified on RustChain" / "block N · vM") that
+    creators can drop on their own sites:
+
+        <a href="https://bottube.ai/anchors/<tx>">
+          <img src="https://bottube.ai/badge/verified/<id>.svg" alt="...">
+        </a>
+
+    Caching is set to 5 minutes — the verification state changes rarely
+    once a row is anchored, and a 5-min stale-read is a fair trade for
+    bounded server load.
+    """
+    state, value, _tx, _v = _verify_state_for_video(video_id)
+    if state == "verified":
+        color = "#0e7c2e"  # green
+        label = "verified on rustchain"
+    elif state == "pending":
+        color = "#b8860b"  # amber
+        label = "anchoring"
+    elif state == "failed":
+        color = "#a02020"  # red
+        label = "verify failed"
+    else:
+        color = "#666"
+        label = "bottube"
+    svg = _verify_badge_svg(state, label, value, color)
+    resp = Response(svg, mimetype="image/svg+xml")
+    resp.headers["Cache-Control"] = "public, max-age=300"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+@app.route("/embed/verify/<video_id>")
+def embed_verify_widget(video_id):
+    """Compact iframe-friendly verification widget.
+
+    Used as <iframe src="/embed/verify/<id>" width=320 height=80 ...>.
+    Renders identical state to the SVG badge but as styled HTML with a
+    backlink to /anchors/<tx>. iframe-safe headers are already applied
+    to /embed/* routes by the global response handler.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_-]{5,32}", video_id):
+        return Response("invalid video id", status=400, mimetype="text/plain")
+    state, value, tx, v = _verify_state_for_video(video_id)
+    return render_template(
+        "embed_verify.html",
+        video_id=video_id, state=state, value=value, tx=tx,
+        manifest_version=v,
+    )
+
+
+@app.route("/embed/bottube-verify.js")
+def bottube_verify_js():
+    """Drop-in JS that finds <div data-bottube-verify="<id>"> elements
+    and replaces them with a live-fetched verification pill.
+
+    Hosted under /embed/ (which already gets framing-permissive headers
+    and falls outside Flask's /static/ handler) so creators can simply
+    <script src="https://bottube.ai/embed/bottube-verify.js"></script>
+    on any page. The body is invariant — host is overridden via
+    data-host="<other-instance>" if the creator's site federates.
+    """
+    js = """/*! bottube-verify.js — public domain widget for on-chain provenance pills */
+(function(){
+  var HOST = (document.currentScript && document.currentScript.dataset && document.currentScript.dataset.host) || 'https://bottube.ai';
+  function pill(state, txt, href){
+    var a = document.createElement('a');
+    a.href = href || (HOST + '/transparency');
+    a.target = '_blank'; a.rel = 'noopener noreferrer';
+    a.className = 'btv-pill btv-' + state;
+    a.style.cssText = 'display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:12px;font:600 12px ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;text-decoration:none;border:1px solid;line-height:1.4;';
+    var pal = state==='verified' ? ['#0e7c2e','#e8f7ec','#7ed091','✓']
+            : state==='pending'  ? ['#7b5800','#fff5da','#e8c477','⧗']
+            : state==='failed'   ? ['#a02020','#fde6e6','#e88080','✕']
+                                 :  ['#444','#eee','#999','?'];
+    a.style.color = pal[0]; a.style.background = pal[1]; a.style.borderColor = pal[2];
+    a.textContent = pal[3] + ' ' + txt;
+    a.title = 'BoTTube on-chain provenance';
+    return a;
+  }
+  function render(vid, target){
+    fetch(HOST + '/api/videos/' + encodeURIComponent(vid) + '/provenance', {credentials:'omit'})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if (!d || !d.ok){
+          target.replaceWith(pill('failed','no provenance', HOST + '/transparency'));
+          return;
+        }
+        var v = d.manifest_version || 1;
+        var anchor = d.anchor || {};
+        var verified = !!d.verified;
+        var state = verified ? 'verified' : (d.pill_state==='failed' ? 'failed' : 'pending');
+        var txt;
+        if (verified && anchor.block_height){
+          txt = 'Verified on RustChain · block ' + anchor.block_height + ' · v' + v;
+        } else if (verified){
+          txt = 'Verified · v' + v;
+        } else {
+          txt = (d.pill_state || 'pending');
+        }
+        var href = anchor.tx_hash ? (HOST + '/anchors/' + anchor.tx_hash) : (HOST + '/transparency');
+        target.replaceWith(pill(state, txt, href));
+      })
+      .catch(function(){
+        target.replaceWith(pill('failed','fetch error', HOST + '/transparency'));
+      });
+  }
+  function init(){
+    var nodes = document.querySelectorAll('[data-bottube-verify]');
+    for (var i=0;i<nodes.length;i++){
+      var el = nodes[i];
+      var vid = el.getAttribute('data-bottube-verify');
+      if (vid) render(vid, el);
+    }
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+  else init();
+})();
+"""
+    resp = Response(js, mimetype="application/javascript; charset=utf-8")
+    # 1 hour CDN-friendly cache; updates roll out within 60 minutes
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+# ---------------------------------------------------------------------------
 # Badges & Embed landing page
 # ---------------------------------------------------------------------------
 
@@ -14684,9 +16361,6419 @@ def embed_guide_page():
     return render_template("embed_guide.html", videos=recent)
 
 
+@app.route("/beacon/atlas")
+def beacon_atlas():
+    """Interactive force-directed Beacon reputation graph visualization."""
+    return render_template("beacon_atlas.html")
+
+
 @app.route("/beacon")
 def beacon_landing_page():
     return render_template("beacon.html")
+
+
+# ---------------------------------------------------------------------------
+# CTR / Thumbnail Analytics API
+# ---------------------------------------------------------------------------
+
+@app.route("/api/ctr/stats")
+def ctr_global_stats():
+    """Get global CTR statistics."""
+    try:
+        summary = _get_ctr_tracker().get_global_summary()
+        return jsonify({"ok": True, **summary})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/ctr/top")
+def ctr_top_videos():
+    """Get top videos by CTR."""
+    limit = min(50, request.args.get("limit", 20, type=int))
+    min_imp = request.args.get("min_impressions", 10, type=int)
+    try:
+        top = _get_ctr_tracker().get_top_by_ctr(limit=limit, min_impressions=min_imp)
+        return jsonify({"ok": True, "videos": top})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/ctr/underperforming")
+def ctr_underperforming():
+    """Get videos with high impressions but low CTR."""
+    try:
+        videos = _get_ctr_tracker().get_underperforming()
+        return jsonify({"ok": True, "videos": videos})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/videos/<video_id>/ctr")
+def video_ctr_stats(video_id):
+    """Get CTR stats for a specific video."""
+    try:
+        stats = _get_ctr_tracker().get_stats(video_id)
+        if not stats:
+            return jsonify({"ok": True, "video_id": video_id, "impressions": 0, "clicks": 0, "ctr": 0})
+        return jsonify({"ok": True, **stats})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/videos/<video_id>/watch_time", methods=["POST"])
+def record_watch_time(video_id):
+    """Record watch time for a video (called by player on pause/close).
+
+    Body: {"seconds": 12.5}
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        seconds = float(data.get("seconds", 0))
+        if seconds > 0:
+            _get_ctr_tracker().record_watch_time(video_id, seconds)
+        return jsonify({"ok": True, "video_id": video_id, "seconds_recorded": seconds})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/videos/<video_id>/ab/variants")
+def video_ab_variants(video_id):
+    """Get A/B test variant stats for a video."""
+    try:
+        stats = _get_ab_manager().get_variant_stats(video_id)
+        winner = _get_ab_manager().get_winner(video_id)
+        return jsonify({"ok": True, "video_id": video_id, "variants": stats, "winner": winner})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Engineering / Public Status Page
+# ---------------------------------------------------------------------------
+# Lightweight observability surface for the public /engineering page.
+# Records request latencies in a thread-safe ring buffer, probes the four
+# RustChain anchor nodes, and reads queue/state counts from the live DB.
+
+from collections import deque as _eng_deque
+from threading import Lock as _eng_Lock
+
+# Two ring buffers: one for user-facing API/UI traffic, one for /admin/*
+# backfill calls (each batch is 50-200 s). Mixing them turns the public
+# p95 into reporting bias — better to surface admin latency as a separate
+# truth panel on the engineering page (per Codex Phase 10 review).
+_ENG_LATENCY = _eng_deque(maxlen=1000)         # user-facing samples (ms)
+_ENG_LATENCY_LOCK = _eng_Lock()
+_ENG_LATENCY_ADMIN = _eng_deque(maxlen=200)    # admin samples (ms)
+_ENG_LATENCY_ADMIN_LOCK = _eng_Lock()
+
+# Path prefixes excluded from latency sampling so static / streaming traffic
+# doesn't dominate the histogram.
+_ENG_LATENCY_SKIP = (
+    "/static/", "/thumbnails/", "/avatars/", "/videos/", "/api/videos/",
+    "/favicon", "/robots", "/sitemap", "/health", "/api/engineering",
+    "/keyframes/", "/renditions/",
+)
+
+# Path prefixes that route to the *admin* ring buffer instead of the
+# user-facing one. Admin work is intentionally slow (ffmpeg, embedding
+# backfill) — call it out, don't pollute the public p95 with it.
+_ENG_LATENCY_ADMIN_PREFIXES = ("/admin/",)
+
+
+@app.before_request
+def _eng_lat_start():
+    g._eng_t0 = time.time()
+
+
+@app.after_request
+def _eng_lat_record(response):
+    try:
+        t0 = getattr(g, "_eng_t0", None)
+        if t0 is None:
+            return response
+        path = request.path or ""
+        # Skip media + static + self
+        if any(path.startswith(p) for p in _ENG_LATENCY_SKIP):
+            return response
+        ms = (time.time() - t0) * 1000.0
+        # Cap absurd values (request still in-flight tail) to keep histogram sane
+        if ms >= 600000:  # 10-min hard ceiling for admin too
+            return response
+        if any(path.startswith(p) for p in _ENG_LATENCY_ADMIN_PREFIXES):
+            with _ENG_LATENCY_ADMIN_LOCK:
+                _ENG_LATENCY_ADMIN.append(ms)
+        elif ms < 30000:
+            with _ENG_LATENCY_LOCK:
+                _ENG_LATENCY.append(ms)
+    except Exception:
+        pass
+    return response
+
+
+# Static node config — keep in code so the page stays honest even if a
+# config DB is unavailable. RTTs are probed at request time.
+_ENG_RUSTCHAIN_NODES = [
+    {"id": "node-1",  "host": "50.28.86.131", "port": 443,  "scheme": "https", "location": "LiquidWeb US (primary)"},
+    {"id": "node-2",  "host": "50.28.86.153", "port": 443,  "scheme": "https", "location": "LiquidWeb US (Ergo anchor)"},
+    {"id": "node-3",  "host": "76.8.228.245", "port": 8099, "scheme": "http",  "location": "Ryan's Proxmox (Texas)"},
+    {"id": "node-4",  "host": "38.76.217.189","port": 8099, "scheme": "http",  "location": "CognetCloud Hong Kong"},
+]
+
+
+def _eng_probe_node(node, timeout=2.0):
+    """Probe a RustChain node /health endpoint. Returns dict with status, rtt_ms."""
+    url = f"{node['scheme']}://{node['host']}:{node['port']}/health"
+    t0 = time.time()
+    try:
+        # urllib instead of requests to avoid adding a dependency
+        ctx = None
+        if node["scheme"] == "https":
+            import ssl as _ssl
+            ctx = _ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
+        req = urllib.request.Request(url, headers={"User-Agent": "BoTTube-Engineering"})
+        if ctx is not None:
+            urllib.request.urlopen(req, timeout=timeout, context=ctx).read(256)
+        else:
+            urllib.request.urlopen(req, timeout=timeout).read(256)
+        rtt = (time.time() - t0) * 1000.0
+        if rtt < 800:
+            status = "ok"
+        elif rtt < 2500:
+            status = "warn"
+        else:
+            status = "err"
+        return {**node, "status": status, "rtt_ms": rtt}
+    except Exception:
+        rtt = (time.time() - t0) * 1000.0
+        return {**node, "status": "err", "rtt_ms": rtt}
+
+
+def _eng_percentile(values, pct):
+    if not values:
+        return 0.0
+    s = sorted(values)
+    k = max(0, min(len(s) - 1, int(round((pct / 100.0) * (len(s) - 1)))))
+    return s[k]
+
+
+def _eng_format_uptime(seconds):
+    seconds = int(max(0, seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, _ = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {mins}m"
+    return f"{mins}m"
+
+
+def _eng_collect():
+    """Collect everything the /engineering page renders."""
+    # Ensure provenance/rendition tables exist so counts are honest.
+    try:
+        _ensure_provenance_schema()
+    except Exception:
+        pass
+    db = get_db()
+
+    # Latency snapshots — two buckets: user-facing API/UI and /admin/*.
+    with _ENG_LATENCY_LOCK:
+        samples = list(_ENG_LATENCY)
+    latency = {
+        "samples": len(samples),
+        "p50": _eng_percentile(samples, 50),
+        "p95": _eng_percentile(samples, 95),
+        "p99": _eng_percentile(samples, 99),
+    }
+    latency["p95_bar"] = max(2.0, min(100.0, (latency["p95"] / 500.0) * 100.0))
+
+    with _ENG_LATENCY_ADMIN_LOCK:
+        admin_samples = list(_ENG_LATENCY_ADMIN)
+    latency_admin = {
+        "samples": len(admin_samples),
+        "p50": _eng_percentile(admin_samples, 50),
+        "p95": _eng_percentile(admin_samples, 95),
+        "p99": _eng_percentile(admin_samples, 99),
+    }
+    # Admin ceiling is 60 s — backfill batches are intentionally slow.
+    latency_admin["p95_bar"] = max(2.0, min(100.0, (latency_admin["p95"] / 60000.0) * 100.0))
+
+    # Node probes (parallel via threads)
+    import concurrent.futures as _cf
+    nodes = []
+    with _cf.ThreadPoolExecutor(max_workers=4) as ex:
+        for n in ex.map(_eng_probe_node, _ENG_RUSTCHAIN_NODES):
+            nodes.append(n)
+
+    # Platform state
+    def _scalar(sql, default=0):
+        try:
+            row = db.execute(sql).fetchone()
+            return int(row[0]) if row and row[0] is not None else default
+        except Exception:
+            return default
+
+    state = {
+        "videos": _scalar("SELECT COUNT(*) FROM videos WHERE COALESCE(is_removed,0)=0"),
+        "agents": _scalar("SELECT COUNT(*) FROM agents WHERE is_human=0"),
+        "humans": _scalar("SELECT COUNT(*) FROM agents WHERE is_human=1"),
+        "comments": _scalar("SELECT COUNT(*) FROM comments"),
+        "tips_confirmed": _scalar("SELECT COUNT(*) FROM tips WHERE COALESCE(status,'confirmed')='confirmed'"),
+        "uptime": _eng_format_uptime(time.time() - APP_START_TS),
+        "version": APP_VERSION,
+    }
+
+    # Generation queue (gpu_jobs may not exist on all installs)
+    queue = {"queued": 0, "running": 0, "completed_24h": 0, "failed_24h": 0, "depth_label": "—"}
+    try:
+        cutoff = time.time() - 86400
+        queue["queued"] = _scalar("SELECT COUNT(*) FROM gpu_jobs WHERE status='queued'")
+        queue["running"] = _scalar("SELECT COUNT(*) FROM gpu_jobs WHERE status='running'")
+        queue["completed_24h"] = _scalar(f"SELECT COUNT(*) FROM gpu_jobs WHERE status='completed' AND COALESCE(completed_at,0)>{cutoff}")
+        queue["failed_24h"] = _scalar(f"SELECT COUNT(*) FROM gpu_jobs WHERE status='failed' AND COALESCE(completed_at,0)>{cutoff}")
+        depth = queue["queued"] + queue["running"]
+        if depth == 0:
+            queue["depth_label"] = "idle"
+        elif depth < 5:
+            queue["depth_label"] = "shallow"
+        elif depth < 20:
+            queue["depth_label"] = "moderate"
+        else:
+            queue["depth_label"] = "deep"
+    except Exception:
+        pass
+
+    # Active experiments — best effort from ab_test tables (exposed by ABTestManager)
+    experiments = []
+    try:
+        rows = db.execute(
+            """SELECT video_id,
+                      COUNT(DISTINCT variant_key) AS variants,
+                      COUNT(*) AS impressions
+                 FROM variant_impressions
+                WHERE created_at > ?
+                GROUP BY video_id
+                HAVING variants >= 2
+                ORDER BY impressions DESC
+                LIMIT 5""",
+            (time.time() - 7 * 86400,),
+        ).fetchall()
+        for r in rows:
+            experiments.append({
+                "name": f"thumb-ab:{r['video_id'][:8]}",
+                "variants": r["variants"],
+                "impressions": r["impressions"],
+            })
+    except Exception:
+        pass
+
+    # Media pipeline summary
+    pipeline = {
+        "renditions": _scalar("SELECT COUNT(*) FROM video_renditions") if _eng_table_exists(db, "video_renditions") else "coming soon",
+        "with_provenance": _scalar("SELECT COUNT(*) FROM video_provenance") if _eng_table_exists(db, "video_provenance") else 0,
+        "anchored": _scalar("SELECT COUNT(*) FROM video_provenance WHERE anchor_tx_hash != ''") if _eng_table_exists(db, "video_provenance") else 0,
+        "avg_encode_s": "—",
+    }
+
+    # Phase 10.3: bucket outcomes (CTR + mean watch seconds) over last 7 days
+    try:
+        outcomes = _feed_imp_outcomes(window_hours=168)
+    except Exception:
+        outcomes = {}
+
+    return {
+        "nodes": nodes,
+        "latency": latency,
+        "latency_admin": latency_admin,
+        "state": state,
+        "queue": queue,
+        "experiments": experiments,
+        "outcomes": outcomes,
+        "pipeline": pipeline,
+        "generated_at": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+    }
+
+
+def _eng_table_exists(db, name):
+    try:
+        row = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+        ).fetchone()
+        return bool(row)
+    except Exception:
+        return False
+
+
+@app.route("/engineering")
+def engineering_page():
+    """Public engineering status page — visible operational maturity."""
+    try:
+        ctx = _eng_collect()
+    except Exception as e:
+        # Never let this page 500 — it's the operational visibility page.
+        ctx = {
+            "nodes": [], "latency": {"p50": 0, "p95": 0, "p99": 0, "samples": 0, "p95_bar": 0},
+            "latency_admin": {"p50": 0, "p95": 0, "p99": 0, "samples": 0, "p95_bar": 0},
+            "state": {"videos": 0, "agents": 0, "humans": 0, "comments": 0, "tips_confirmed": 0,
+                      "uptime": "?", "version": APP_VERSION},
+            "queue": {"queued": 0, "running": 0, "completed_24h": 0, "failed_24h": 0, "depth_label": f"err: {e}"},
+            "experiments": [], "outcomes": {}, "pipeline": {"renditions": 0, "with_provenance": 0, "anchored": 0, "avg_encode_s": "?"},
+            "generated_at": "error",
+        }
+    return render_template("engineering.html", **ctx)
+
+
+@app.route("/api/engineering")
+def engineering_api():
+    """JSON variant of /engineering for live refresh."""
+    try:
+        return jsonify({"ok": True, **_eng_collect()})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Provenance — surface on-chain video attestation per Codex spec
+# ---------------------------------------------------------------------------
+# Schema and API for first-class video provenance. Init done lazily on
+# first request so we don't have to touch init_db() during a hot deploy.
+
+_PROVENANCE_SCHEMA_READY = False
+_PROVENANCE_SCHEMA_LOCK = _eng_Lock()
+
+
+def _ensure_provenance_schema():
+    global _PROVENANCE_SCHEMA_READY
+    if _PROVENANCE_SCHEMA_READY:
+        return
+    with _PROVENANCE_SCHEMA_LOCK:
+        if _PROVENANCE_SCHEMA_READY:
+            return
+        conn = sqlite3.connect(str(DB_PATH))
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS video_provenance (
+                    video_id              TEXT PRIMARY KEY,
+                    canonical_sha256      TEXT DEFAULT '',
+                    duration_sec          REAL DEFAULT 0,
+                    width                 INTEGER DEFAULT 0,
+                    height                INTEGER DEFAULT 0,
+                    creator_agent_id      INTEGER DEFAULT 0,
+                    creator_pubkey        TEXT DEFAULT '',
+                    creator_beacon_id     TEXT DEFAULT '',
+                    model                 TEXT DEFAULT '',
+                    provider              TEXT DEFAULT '',
+                    workflow_hash         TEXT DEFAULT '',
+                    prompt_hash           TEXT DEFAULT '',
+                    seed                  INTEGER DEFAULT 0,
+                    generated_at          REAL DEFAULT 0,
+                    uploader_sig          TEXT DEFAULT '',
+                    uploaded_at           REAL DEFAULT 0,
+                    anchor_chain          TEXT DEFAULT '',
+                    anchor_tx_hash        TEXT DEFAULT '',
+                    anchor_block_height   INTEGER DEFAULT 0,
+                    anchor_manifest_hash  TEXT DEFAULT '',
+                    parents_json          TEXT DEFAULT '[]',
+                    renditions_json       TEXT DEFAULT '[]',
+                    verified              INTEGER DEFAULT 0,
+                    created_at            REAL DEFAULT 0,
+                    updated_at            REAL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_provenance_anchor
+                    ON video_provenance(anchor_tx_hash);
+                CREATE INDEX IF NOT EXISTS idx_provenance_creator
+                    ON video_provenance(creator_agent_id);
+                CREATE TABLE IF NOT EXISTS video_renditions (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    video_id      TEXT NOT NULL,
+                    label         TEXT NOT NULL,        -- e.g. 'canonical', '720p', '360p'
+                    url_path      TEXT NOT NULL,
+                    width         INTEGER DEFAULT 0,
+                    height        INTEGER DEFAULT 0,
+                    bitrate_kbps  INTEGER DEFAULT 0,
+                    codec         TEXT DEFAULT 'h264',
+                    file_sha256   TEXT DEFAULT '',
+                    file_size     INTEGER DEFAULT 0,
+                    vmaf          REAL DEFAULT 0,
+                    is_canonical  INTEGER DEFAULT 0,
+                    created_at    REAL DEFAULT 0,
+                    UNIQUE(video_id, label)
+                );
+                CREATE INDEX IF NOT EXISTS idx_renditions_video
+                    ON video_renditions(video_id);
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        _PROVENANCE_SCHEMA_READY = True
+
+
+def _build_provenance_payload(video_row, prov_row, renditions):
+    """Build the public provenance JSON for a video, filling defaults from videos table."""
+    vid = video_row["video_id"]
+    # canonical asset = either provenance row (preferred) or what we know from videos
+    canonical_sha = (prov_row["canonical_sha256"] if prov_row else "") or ""
+    duration = (prov_row["duration_sec"] if prov_row else 0) or video_row["duration_sec"] or 0
+    width = (prov_row["width"] if prov_row else 0) or video_row["width"] or 720
+    height = (prov_row["height"] if prov_row else 0) or video_row["height"] or 720
+
+    creator = {
+        "agent_id": (prov_row["creator_agent_id"] if prov_row else 0) or video_row["agent_id"],
+        "agent_name": video_row["agent_name"],
+        "display_name": video_row["display_name"] or video_row["agent_name"],
+        "pubkey": (prov_row["creator_pubkey"] if prov_row else "") or "",
+        "beacon_id": (prov_row["creator_beacon_id"] if prov_row else "") or "",
+    }
+    generation = {
+        "model": (prov_row["model"] if prov_row else "") or "",
+        "provider": (prov_row["provider"] if prov_row else "") or "",
+        "workflow_hash": (prov_row["workflow_hash"] if prov_row else "") or "",
+        "prompt_hash": (prov_row["prompt_hash"] if prov_row else "") or "",
+        "seed": (prov_row["seed"] if prov_row else 0) or 0,
+        "generated_at": (prov_row["generated_at"] if prov_row else 0) or 0,
+    }
+    upload = {
+        "uploader_sig": (prov_row["uploader_sig"] if prov_row else "") or "",
+        "uploaded_at": (prov_row["uploaded_at"] if prov_row else 0) or video_row["created_at"] or 0,
+    }
+    anchor = {
+        "chain": (prov_row["anchor_chain"] if prov_row else "") or "",
+        "tx_hash": (prov_row["anchor_tx_hash"] if prov_row else "") or "",
+        "block_height": (prov_row["anchor_block_height"] if prov_row else 0) or 0,
+        "manifest_hash": (prov_row["anchor_manifest_hash"] if prov_row else "") or "",
+    }
+
+    parents = []
+    try:
+        parents = json.loads(prov_row["parents_json"]) if prov_row else []
+    except Exception:
+        parents = []
+
+    rends = []
+    for r in renditions or []:
+        rends.append({
+            "label": r["label"],
+            "url": r["url_path"],
+            "width": r["width"],
+            "height": r["height"],
+            "bitrate_kbps": r["bitrate_kbps"],
+            "codec": r["codec"],
+            "file_sha256": r["file_sha256"],
+            "file_size": r["file_size"],
+            "vmaf": r["vmaf"],
+            "is_canonical": bool(r["is_canonical"]),
+        })
+
+    # Verified iff anchor.tx_hash present AND uploader_sig present
+    verified = bool(anchor["tx_hash"]) and bool(upload["uploader_sig"])
+    if prov_row and prov_row["verified"]:
+        verified = True
+
+    # Decide an overall pill state
+    if verified:
+        pill_state = "verified"
+    elif anchor["tx_hash"] or upload["uploader_sig"]:
+        pill_state = "pending"
+    else:
+        pill_state = "unverified"
+
+    # Phase 11.12: optional thumbnail integrity hash (additive, not in anchor leaf).
+    # Phase 11.16: surface manifest_version so verifiers know which leaf
+    # recipe applies, and the canonical_360p_sha256 if present.
+    thumb_sha = ""
+    p360_sha = ""
+    manifest_ver = 1
+    try:
+        if prov_row is not None:
+            row_keys = prov_row.keys()
+            if "thumbnail_sha256" in row_keys:
+                thumb_sha = (prov_row["thumbnail_sha256"] or "")
+            if "canonical_360p_sha256" in row_keys:
+                p360_sha = (prov_row["canonical_360p_sha256"] or "")
+            if "manifest_version" in row_keys:
+                manifest_ver = int(prov_row["manifest_version"] or 1)
+    except Exception:
+        pass
+
+    in_leaf_v2 = manifest_ver >= 2
+
+    # Phase 11.24: also expose thumbnail URL + 360p rendition URL so the
+    # verifier can optionally re-hash them (--check-asset on v2 rows).
+    # Pull thumbnail filename from video_row (already joined upstream).
+    thumb_url = ""
+    try:
+        thumb_filename = video_row["thumbnail"] if "thumbnail" in video_row.keys() else ""
+        if thumb_filename:
+            thumb_url = f"/thumbnails/{thumb_filename}"
+    except Exception:
+        thumb_url = ""
+    p360_url = f"/renditions/{vid}/360p.mp4" if p360_sha else ""
+
+    return {
+        "video_id": vid,
+        "manifest_version": manifest_ver,
+        "pill_state": pill_state,
+        "verified": verified,
+        "canonical_asset": {
+            "sha256": canonical_sha,
+            "duration": duration,
+            "width": width,
+            "height": height,
+            # Phase 11.21: surface the asset URL so the verifier can
+            # optionally re-hash the bytes bottube serves today and prove
+            # they still match the anchored hash.
+            "url": f"/api/videos/{vid}/stream",
+        },
+        "thumbnail": {
+            "sha256": thumb_sha,
+            "url": thumb_url,
+            "in_anchor_leaf": in_leaf_v2 and bool(thumb_sha),
+            "note": (
+                "Hashed at upload time and folded into the anchored Merkle leaf "
+                "starting in manifest v2."
+                if in_leaf_v2 and thumb_sha else
+                "Hashed at upload time and persisted, but not part of the "
+                "anchored Merkle leaf in this manifest version. "
+                "v1 anchors only commit canonical_sha256."
+            ),
+        },
+        "canonical_360p": {
+            "sha256": p360_sha,
+            "url": p360_url,
+            "in_anchor_leaf": in_leaf_v2 and bool(p360_sha),
+        },
+        "renditions": rends,
+        "creator": creator,
+        "generation": generation,
+        "upload": upload,
+        "anchor": anchor,
+        "parents": parents,
+    }
+
+
+@app.route("/api/videos/<video_id>/provenance")
+def video_provenance(video_id):
+    """Public provenance JSON for a video — first-class platform primitive."""
+    _ensure_provenance_schema()
+    db = get_db()
+    video = db.execute(
+        """SELECT v.video_id, v.agent_id, v.duration_sec, v.width, v.height, v.created_at,
+                  v.thumbnail,
+                  a.agent_name, a.display_name
+             FROM videos v JOIN agents a ON v.agent_id = a.id
+            WHERE v.video_id = ?""",
+        (video_id,),
+    ).fetchone()
+    if not video:
+        return jsonify({"ok": False, "error": "video not found"}), 404
+
+    prov_row = db.execute(
+        "SELECT * FROM video_provenance WHERE video_id = ?", (video_id,)
+    ).fetchone()
+    rendition_rows = db.execute(
+        """SELECT label, url_path, width, height, bitrate_kbps, codec,
+                  file_sha256, file_size, vmaf, is_canonical
+             FROM video_renditions WHERE video_id = ?
+            ORDER BY is_canonical DESC, width DESC""",
+        (video_id,),
+    ).fetchall()
+
+    payload = _build_provenance_payload(video, prov_row, rendition_rows)
+    return jsonify({"ok": True, **payload})
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle Timeline — generated → uploaded → anchored → rewarded
+# ---------------------------------------------------------------------------
+
+@app.route("/api/videos/<video_id>/lifecycle")
+def video_lifecycle(video_id):
+    """Public lifecycle of a video: 4 milestone events with timestamps.
+
+    Used by the cinematic player widget to render the on-chain lineage
+    of an AI-generated video, tying provenance + reward + anchor data
+    into a single visible timeline.
+    """
+    _ensure_provenance_schema()
+    db = get_db()
+    video = db.execute(
+        "SELECT video_id, created_at FROM videos WHERE video_id = ?",
+        (video_id,),
+    ).fetchone()
+    if not video:
+        return jsonify({"ok": False, "error": "video not found"}), 404
+
+    prov = db.execute(
+        """SELECT generated_at, uploaded_at, anchor_chain, anchor_tx_hash,
+                  anchor_block_height, anchor_manifest_hash
+             FROM video_provenance WHERE video_id = ?""",
+        (video_id,),
+    ).fetchone()
+
+    # Earliest reward (earnings + tips, if any) for this video.
+    reward_at = 0.0
+    reward_kind = ""
+    try:
+        row = db.execute(
+            """SELECT MIN(created_at) AS at FROM earnings WHERE video_id = ?""",
+            (video_id,),
+        ).fetchone()
+        if row and row["at"]:
+            reward_at = float(row["at"])
+            reward_kind = "earnings"
+    except Exception:
+        pass
+    if not reward_at:
+        try:
+            row = db.execute(
+                """SELECT MIN(created_at) AS at FROM tips
+                    WHERE video_id = ? AND COALESCE(status,'confirmed')='confirmed'""",
+                (video_id,),
+            ).fetchone()
+            if row and row["at"]:
+                reward_at = float(row["at"])
+                reward_kind = "tip"
+        except Exception:
+            pass
+
+    uploaded_at = (prov["uploaded_at"] if prov and prov["uploaded_at"] else None) or video["created_at"] or 0
+    generated_at = (prov["generated_at"] if prov and prov["generated_at"] else None)
+    if not generated_at:
+        # Best-guess: generation precedes upload by a few seconds.
+        # We mark this as inferred so the UI can render it lighter.
+        generated_at = max(0.0, float(uploaded_at) - 5.0)
+        generated_inferred = True
+    else:
+        generated_inferred = False
+
+    anchor_at = 0.0
+    anchor_inferred = False
+    if prov and prov["anchor_tx_hash"]:
+        # We don't store anchor_at separately yet; approximate as uploaded_at + 60s
+        # so the tick lands meaningfully on the timeline. UI should mark inferred.
+        anchor_at = float(uploaded_at) + 60.0
+        anchor_inferred = True
+
+    events = [
+        {
+            "key": "generated",
+            "label": "Generated",
+            "icon": "✦",
+            "at": float(generated_at) if generated_at else 0.0,
+            "present": bool(generated_at),
+            "inferred": generated_inferred,
+            "detail": "AI canonical artifact created" + (" (inferred from upload time)" if generated_inferred else ""),
+        },
+        {
+            "key": "uploaded",
+            "label": "Uploaded",
+            "icon": "↑",
+            "at": float(uploaded_at) if uploaded_at else 0.0,
+            "present": bool(uploaded_at),
+            "inferred": False,
+            "detail": "Manifest signed and pushed to BoTTube",
+        },
+        {
+            "key": "anchored",
+            "label": "Anchored",
+            "icon": "⛓",
+            "at": anchor_at,
+            "present": bool(prov and prov["anchor_tx_hash"]),
+            "inferred": anchor_inferred,
+            "detail": (f"RustChain block {prov['anchor_block_height']}"
+                       if prov and prov["anchor_block_height"] else
+                       "Awaiting RustChain anchor"),
+            "tx_hash": prov["anchor_tx_hash"] if prov else "",
+            "chain": prov["anchor_chain"] if prov else "",
+        },
+        {
+            "key": "rewarded",
+            "label": "Rewarded",
+            "icon": "★",
+            "at": reward_at,
+            "present": bool(reward_at),
+            "inferred": False,
+            "detail": (f"First {reward_kind} received" if reward_at
+                       else "No reward issued yet"),
+        },
+    ]
+
+    # Compute relative positions on the timeline (0..1)
+    timestamps = [e["at"] for e in events if e["at"] > 0]
+    t_min = min(timestamps) if timestamps else 0.0
+    t_max = max(timestamps) if timestamps else 0.0
+    span = max(1.0, t_max - t_min)
+    for e in events:
+        if e["at"] > 0:
+            e["rel"] = round((e["at"] - t_min) / span, 4)
+        else:
+            e["rel"] = None
+
+    return jsonify({
+        "ok": True,
+        "video_id": video_id,
+        "events": events,
+        "t_min": t_min,
+        "t_max": t_max,
+        "span_s": round(span, 2),
+    })
+
+
+# ---------------------------------------------------------------------------
+# Keyframe sprites — auto-extract for the cinematic scrub strip
+# ---------------------------------------------------------------------------
+
+KEYFRAME_DIR = BASE_DIR / "keyframes"
+KEYFRAME_COUNT = 6
+KEYFRAME_SIZE = 120  # pixels per frame, square
+
+# Module-level lock per-video to avoid concurrent ffmpeg storms on cache-miss.
+_KEYFRAME_LOCKS = {}
+_KEYFRAME_LOCKS_LOCK = _eng_Lock()
+
+
+def _keyframe_lock_for(video_id):
+    with _KEYFRAME_LOCKS_LOCK:
+        lk = _KEYFRAME_LOCKS.get(video_id)
+        if lk is None:
+            lk = _eng_Lock()
+            _KEYFRAME_LOCKS[video_id] = lk
+        return lk
+
+
+def _generate_keyframe_sprite(video_path, sprite_path, frames=KEYFRAME_COUNT, size=KEYFRAME_SIZE):
+    """Run ffmpeg to produce a horizontal sprite of N keyframes.
+
+    Uses select=eq(n,...) instead of relying on i-frames so even GOP-locked
+    AI output gets sampled at predictable positions.
+    """
+    KEYFRAME_DIR.mkdir(parents=True, exist_ok=True)
+    # Get duration first (cheap, ffprobe)
+    try:
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+            stderr=subprocess.DEVNULL, timeout=10,
+        )
+        duration = float(out.strip() or 0)
+    except Exception:
+        duration = 8.0
+
+    if duration <= 0:
+        duration = 8.0
+
+    # Sample frames at evenly spaced timestamps (slight inset so we don't grab black tail).
+    inset = max(0.05, duration * 0.02)
+    step = (duration - 2 * inset) / max(1, frames - 1)
+    times = [inset + i * step for i in range(frames)]
+
+    # Build a select expression: gte(t,T0)*lte(t,T0+0.05) OR ... with reset(N=PI) trick
+    # Simpler approach: extract each frame to a temp file and tile manually with -filter_complex.
+    # We'll use the more efficient approach: -ss + -frames:v 1 per frame, then montage via ffmpeg tile.
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="bt_kf_") as tmp:
+        tmp_path = Path(tmp)
+        frame_paths = []
+        for i, t in enumerate(times):
+            fp = tmp_path / f"f{i:02d}.jpg"
+            subprocess.run(
+                ["ffmpeg", "-loglevel", "error", "-ss", f"{t:.3f}", "-i", str(video_path),
+                 "-frames:v", "1", "-vf", f"scale={size}:{size}:force_original_aspect_ratio=increase,crop={size}:{size}",
+                 "-q:v", "5", "-y", str(fp)],
+                check=True, timeout=15, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            frame_paths.append(str(fp))
+
+        # Tile horizontally
+        # Build -i for each frame, then xstack-style hstack
+        cmd = ["ffmpeg", "-loglevel", "error"]
+        for fp in frame_paths:
+            cmd += ["-i", fp]
+        filter_inputs = "".join(f"[{i}:v]" for i in range(len(frame_paths)))
+        cmd += ["-filter_complex", f"{filter_inputs}hstack=inputs={len(frame_paths)}",
+                "-q:v", "5", "-y", str(sprite_path)]
+        subprocess.run(cmd, check=True, timeout=20,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    return {"frames": frames, "frame_size": size, "duration": duration}
+
+
+@app.route("/api/videos/<video_id>/keyframes")
+def video_keyframes(video_id):
+    """Return keyframe sprite manifest. Generates on first hit, then cached.
+
+    The sprite is a horizontal strip of N square thumbnails. The watch
+    page renders this above the native player and uses CSS transform to
+    show the active frame as the playhead moves.
+    """
+    db = get_db()
+    video = db.execute(
+        "SELECT video_id, filename, duration_sec FROM videos WHERE video_id = ?",
+        (video_id,),
+    ).fetchone()
+    if not video:
+        return jsonify({"ok": False, "error": "video not found"}), 404
+
+    sprite_filename = f"{video_id}.jpg"
+    sprite_path = KEYFRAME_DIR / sprite_filename
+    duration = video["duration_sec"] or 8.0
+
+    if not sprite_path.exists() or sprite_path.stat().st_size < 256:
+        video_path = VIDEO_DIR / (video["filename"] or "")
+        if not video_path.exists():
+            return jsonify({"ok": False, "error": "video file missing"}), 404
+        lock = _keyframe_lock_for(video_id)
+        with lock:
+            if not sprite_path.exists() or sprite_path.stat().st_size < 256:
+                try:
+                    _generate_keyframe_sprite(video_path, sprite_path)
+                except subprocess.CalledProcessError as e:
+                    return jsonify({"ok": False, "error": f"ffmpeg failed: {e.returncode}"}), 500
+                except subprocess.TimeoutExpired:
+                    return jsonify({"ok": False, "error": "ffmpeg timeout"}), 504
+                except Exception as e:
+                    return jsonify({"ok": False, "error": str(e)}), 500
+
+    return jsonify({
+        "ok": True,
+        "video_id": video_id,
+        "sprite_url": f"/keyframes/{sprite_filename}",
+        "frame_count": KEYFRAME_COUNT,
+        "frame_width": KEYFRAME_SIZE,
+        "frame_height": KEYFRAME_SIZE,
+        "duration": duration,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Phase 10.4: MCP-compatible tool surface (read-only)
+# ---------------------------------------------------------------------------
+# Per Codex: "If you only ship the descriptor and not the bridge, do not
+# market that as MCP-compatible." Below: the descriptor at
+# /.well-known/mcp.json plus a JSON-RPC-shaped /mcp bridge that wraps the
+# existing REST endpoints. Five tools: feed.get, video.get, video.similar,
+# video.provenance, video.keyframes. No write tools, no auth — read-only
+# is honest about what's actually safe to expose to a discovering agent.
+
+MCP_VERSION = "1.0"
+MCP_TOOLS = [
+    {
+        "name": "feed.get",
+        "description": (
+            "Return ranked videos from a BoTTube feed bucket. "
+            "Use bucket=hybrid-v1 for embedding-based recommendations, "
+            "bucket=heuristic for popularity-only, bucket=latest for chronological. "
+            "Each result includes _why (recommendation explanation), _score, "
+            "and _components (signal breakdown for hybrid-v1)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "bucket": {
+                    "type": "string",
+                    "enum": ["latest", "heuristic", "hybrid-v1", "auto"],
+                    "default": "auto",
+                },
+                "per_page": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+                "page": {"type": "integer", "minimum": 1, "default": 1},
+                "category": {"type": "string"},
+            },
+        },
+        "rest_path": "/api/feed",
+        "rest_method": "GET",
+    },
+    {
+        "name": "video.get",
+        "description": (
+            "Look up a single video by id. Returns title, description, tags, "
+            "creator agent, view count, and other metadata."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": ["video_id"],
+            "properties": {
+                "video_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{5,32}$"},
+            },
+        },
+        "rest_path": "/api/videos/{video_id}",
+        "rest_method": "GET",
+    },
+    {
+        "name": "video.similar",
+        "description": (
+            "Top-K cosine-similar videos to a given video, computed against the "
+            "in-memory text-embedding cache (Gemini gemini-embedding-2, 3072-d). "
+            "Vectors are L2-normalized so the score is direct cosine in [-1, 1]."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": ["video_id"],
+            "properties": {
+                "video_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{5,32}$"},
+                "k": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+            },
+        },
+        "rest_path": "/api/videos/{video_id}/similar",
+        "rest_method": "GET",
+    },
+    {
+        "name": "video.provenance",
+        "description": (
+            "Cryptographic provenance for a video: canonical asset SHA-256, "
+            "creator agent identity, generation model + prompt hash + seed, "
+            "uploader signature (HMAC-SHA256), RustChain anchor TX (when "
+            "anchored). Three states: verified | pending | unverified."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": ["video_id"],
+            "properties": {
+                "video_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{5,32}$"},
+            },
+        },
+        "rest_path": "/api/videos/{video_id}/provenance",
+        "rest_method": "GET",
+    },
+    {
+        "name": "video.keyframes",
+        "description": (
+            "6-frame keyframe sprite for a video, auto-extracted via ffmpeg. "
+            "Returns the sprite URL, frame_count, frame_width, frame_height, "
+            "and duration. Useful for client-side scrub bars or scene preview."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": ["video_id"],
+            "properties": {
+                "video_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{5,32}$"},
+            },
+        },
+        "rest_path": "/api/videos/{video_id}/keyframes",
+        "rest_method": "GET",
+    },
+]
+
+
+def _mcp_descriptor():
+    """Public MCP descriptor — what the server is and what tools it offers."""
+    return {
+        "schema_version": MCP_VERSION,
+        "name": "bottube",
+        "title": "BoTTube — AI-native video platform",
+        "description": (
+            "Read-only MCP surface over BoTTube. Agents can browse the "
+            "ranked feed, fetch video metadata + provenance, and look up "
+            "semantically similar videos. Write tools (upload, comment, vote) "
+            "are gated by the existing /api/register + /api/agents/me/accept-terms "
+            "human-side flow and are intentionally not exposed here."
+        ),
+        "homepage": "https://bottube.ai",
+        "documentation": "https://bottube.ai/docs",
+        "engineering": "https://bottube.ai/engineering",
+        "endpoints": {
+            "rpc": "https://bottube.ai/mcp",
+            "rest_base": "https://bottube.ai/api",
+        },
+        "auth": {"type": "none", "note": "Read-only tools require no key."},
+        "tools": [
+            {k: v for k, v in tool.items() if k != "rest_path" and k != "rest_method"}
+            for tool in MCP_TOOLS
+        ],
+        "license": "MIT",
+    }
+
+
+# --- Phase 11.11: /xrpc/feed.firehose -------------------------------------
+# Federation spec §4 made partially live. Signed firehose of video.create
+# events with monotonic cursor pagination. Relay key is Ed25519, generated
+# on first request and persisted to disk. Public pubkey served at
+# /.well-known/relay/key.
+
+FIREHOSE_RELAY_KEY_PATH = BASE_DIR / "relay_ed25519.key"
+_FIREHOSE_RELAY = {"sk": None, "pk": None, "did": "did:web:bottube.ai"}
+_FIREHOSE_LOCK = threading.Lock()
+
+
+def _firehose_load_relay_key():
+    """Lazy-init relay Ed25519 keypair. Persists to /root/bottube/relay_ed25519.key."""
+    if _FIREHOSE_RELAY["sk"] is not None:
+        return
+    with _FIREHOSE_LOCK:
+        if _FIREHOSE_RELAY["sk"] is not None:
+            return
+        try:
+            import nacl.signing as _nacl_signing
+            import nacl.encoding as _nacl_encoding
+        except ImportError:
+            return
+        if FIREHOSE_RELAY_KEY_PATH.exists():
+            try:
+                seed = FIREHOSE_RELAY_KEY_PATH.read_bytes()
+                if len(seed) >= 32:
+                    sk = _nacl_signing.SigningKey(seed[:32])
+                else:
+                    sk = _nacl_signing.SigningKey.generate()
+                    FIREHOSE_RELAY_KEY_PATH.write_bytes(bytes(sk))
+                    os.chmod(FIREHOSE_RELAY_KEY_PATH, 0o600)
+            except Exception:
+                sk = _nacl_signing.SigningKey.generate()
+                FIREHOSE_RELAY_KEY_PATH.write_bytes(bytes(sk))
+                os.chmod(FIREHOSE_RELAY_KEY_PATH, 0o600)
+        else:
+            sk = _nacl_signing.SigningKey.generate()
+            FIREHOSE_RELAY_KEY_PATH.write_bytes(bytes(sk))
+            os.chmod(FIREHOSE_RELAY_KEY_PATH, 0o600)
+        _FIREHOSE_RELAY["sk"] = sk
+        _FIREHOSE_RELAY["pk"] = sk.verify_key
+
+
+def _firehose_canonical_json(obj):
+    """Stable JSON encoding for signing. Sorted keys, no whitespace."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode("utf-8")
+
+
+def _firehose_sign(payload):
+    """Return base64-url Ed25519 signature over canonical JSON of payload."""
+    _firehose_load_relay_key()
+    sk = _FIREHOSE_RELAY.get("sk")
+    if sk is None:
+        return ""
+    import base64
+    sig = sk.sign(_firehose_canonical_json(payload)).signature
+    return base64.urlsafe_b64encode(sig).rstrip(b"=").decode("ascii")
+
+
+def _firehose_relay_pubkey_b64():
+    _firehose_load_relay_key()
+    pk = _FIREHOSE_RELAY.get("pk")
+    if pk is None:
+        return ""
+    import base64
+    return base64.urlsafe_b64encode(bytes(pk)).rstrip(b"=").decode("ascii")
+
+
+@app.route("/.well-known/relay/key")
+def well_known_relay_key():
+    """Public Ed25519 pubkey for the firehose relay signature verification."""
+    _firehose_load_relay_key()
+    pk_b64 = _firehose_relay_pubkey_b64()
+    if not pk_b64:
+        return jsonify({"ok": False, "error": "relay key unavailable"}), 503
+    payload = {
+        "@context": "https://www.w3.org/ns/did/v1",
+        "id": "did:web:bottube.ai#firehose-relay",
+        "controller": "did:web:bottube.ai",
+        "type": "Ed25519VerificationKey2020",
+        "publicKeyMultibase": pk_b64,
+        "publicKeyEncoding": "base64url-unpadded",
+        "service": [{
+            "id": "did:web:bottube.ai#firehose",
+            "type": "BoTTubeFirehose",
+            "serviceEndpoint": "https://bottube.ai/xrpc/feed.firehose",
+        }],
+    }
+    resp = jsonify(payload)
+    resp.headers["Content-Type"] = "application/did+json"
+    resp.headers["Cache-Control"] = "public, max-age=300"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+@app.route("/xrpc/feed.firehose")
+def xrpc_feed_firehose():
+    """Phase 11.11: signed firehose of video.create events.
+
+    Cursor format: <created_at_ms>:<rowid>. Both segments are integers
+    drawn from the videos table, so consecutive paginated reads are
+    stable even as new uploads arrive.
+    """
+    cursor = (request.args.get("cursor") or "").strip()
+    try:
+        limit = max(1, min(200, int(request.args.get("limit", 100))))
+    except Exception:
+        limit = 100
+    ip = _get_client_ip()
+    if not _rate_limit(f"firehose:{ip}", 30, 60):
+        return jsonify({"ok": False, "error": "rate limited"}), 429
+
+    after_ms, after_rowid = 0, 0
+    if cursor:
+        m = re.match(r"^(\d+):(\d+)$", cursor)
+        if not m:
+            return jsonify({"ok": False, "error": "invalid cursor"}), 400
+        after_ms = int(m.group(1))
+        after_rowid = int(m.group(2))
+
+    db = get_db()
+    after_secs = after_ms / 1000.0
+    rows = db.execute(
+        """SELECT v.id AS rowid, v.video_id, v.title, v.thumbnail, v.duration_sec,
+                  v.created_at, a.agent_name,
+                  COALESCE(p.canonical_sha256, '') AS canonical_sha256,
+                  COALESCE(p.uploader_sig, '') AS uploader_sig,
+                  COALESCE(p.anchor_chain, '') AS anchor_chain,
+                  COALESCE(p.anchor_tx_hash, '') AS anchor_tx_hash,
+                  COALESCE(p.anchor_block_height, 0) AS anchor_block_height,
+                  COALESCE(p.anchor_manifest_hash, '') AS anchor_manifest_hash
+             FROM videos v
+             JOIN agents a ON a.id = v.agent_id
+             LEFT JOIN video_provenance p ON p.video_id = v.video_id
+            WHERE COALESCE(v.is_removed, 0) = 0
+              AND COALESCE(a.is_banned, 0) = 0
+              AND (
+                    v.created_at > ?
+                 OR (v.created_at = ? AND v.id > ?)
+                  )
+            ORDER BY v.created_at ASC, v.id ASC
+            LIMIT ?""",
+        (after_secs, after_secs, after_rowid, limit + 1),
+    ).fetchall()
+
+    has_more = len(rows) > limit
+    page = rows[:limit]
+
+    events = []
+    for r in page:
+        ts_ms = int(float(r["created_at"] or 0) * 1000)
+        ev = {
+            "cursor": f"{ts_ms}:{r['rowid']}",
+            "ts": float(r["created_at"] or 0),
+            "op": "video.create",
+            "relay_did": "did:web:bottube.ai",
+            "actor_did": f"did:web:bottube.ai:{r['agent_name']}",
+            "video_id": r["video_id"],
+            "manifest_sha256": r["canonical_sha256"],
+            "anchor_tx_hash": r["anchor_tx_hash"],
+            "anchor_chain": r["anchor_chain"] or "rustchain",
+            "block_height": r["anchor_block_height"],
+            "merkle_root": r["anchor_manifest_hash"],
+            "canonical_url": f"https://bottube.ai/api/videos/{r['video_id']}/stream",
+            "watch_url": f"https://bottube.ai/watch/{r['video_id']}",
+            "title": r["title"] or "",
+            "duration_sec": r["duration_sec"] or 0,
+        }
+        # Sign the canonical JSON of the event minus the sig field.
+        ev["sig"] = _firehose_sign(ev)
+        events.append(ev)
+
+    next_cursor = events[-1]["cursor"] if events and has_more else None
+
+    payload = {
+        "ok": True,
+        "events": events,
+        "next_cursor": next_cursor,
+        "relay_did": "did:web:bottube.ai",
+        "relay_pubkey": _firehose_relay_pubkey_b64(),
+        "spec_version": "0.1",
+        "spec_url": "https://bottube.ai/federation",
+    }
+    resp = jsonify(payload)
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+@app.route("/.well-known/agent/<handle>")
+def well_known_agent(handle):
+    """Phase 11.10: DID:web actor doc.
+
+    Implements the /federation spec's identity layer for current platform
+    actors. Anyone resolving `agent://did:web:bottube.ai:<handle>` can fetch
+    this endpoint for the canonical actor descriptor.
+    """
+    if not re.fullmatch(r"[a-z0-9_-]{2,32}", handle or ""):
+        abort(404)
+    db = get_db()
+    # Phase 11.23: also pull the Ed25519 keypair (idempotently created
+    # at first upload) so the actor doc exposes the real signing key.
+    try:
+        cols = {row[1] for row in db.execute("PRAGMA table_info(agents)").fetchall()}
+        ed_col = "ed25519_pubkey" if "ed25519_pubkey" in cols else None
+    except Exception:
+        ed_col = None
+
+    if ed_col:
+        agent = db.execute(
+            f"""SELECT id, agent_name, display_name, bio, avatar_url, is_human,
+                      created_at,
+                      COALESCE(rtc_wallet, '') AS rtc_wallet,
+                      COALESCE(rtc_address, '') AS rtc_address,
+                      COALESCE({ed_col}, '') AS ed25519_pubkey
+                 FROM agents WHERE agent_name = ?
+                                    AND COALESCE(is_banned, 0) = 0
+                                    AND COALESCE(is_suspended, 0) = 0""",
+            (handle,),
+        ).fetchone()
+    else:
+        agent = db.execute(
+            """SELECT id, agent_name, display_name, bio, avatar_url, is_human,
+                      created_at,
+                      COALESCE(rtc_wallet, '') AS rtc_wallet,
+                      COALESCE(rtc_address, '') AS rtc_address
+                 FROM agents WHERE agent_name = ?
+                                    AND COALESCE(is_banned, 0) = 0
+                                    AND COALESCE(is_suspended, 0) = 0""",
+            (handle,),
+        ).fetchone()
+    if not agent:
+        abort(404)
+
+    rtc_addr = agent["rtc_wallet"] or agent["rtc_address"] or ""
+    ed_pub = ""
+    try:
+        ed_pub = agent["ed25519_pubkey"] if ed_col else ""
+    except Exception:
+        ed_pub = ""
+
+    actor_doc = {
+        "@context": "https://www.w3.org/ns/did/v1",
+        "id": f"did:web:bottube.ai:{handle}",
+        "alsoKnownAs": [
+            f"agent://did:web:bottube.ai:{handle}",
+            f"https://bottube.ai/agent/{handle}",
+        ],
+        "service": [{
+            "id": f"did:web:bottube.ai:{handle}#bottube-home",
+            "type": "BoTTubeHomeInstance",
+            "serviceEndpoint": "https://bottube.ai",
+        }],
+        "handle": f"@{handle}@bottube.ai",
+        "homeInstance": "https://bottube.ai",
+        "displayName": agent["display_name"] or handle,
+        "isHuman": bool(agent["is_human"]),
+        "bio": (agent["bio"] or "")[:500],
+        "avatar": (agent["avatar_url"] or f"https://bottube.ai/avatar/{handle}.svg"),
+        "createdAt": int(float(agent["created_at"] or 0)),
+    }
+    methods = []
+    if ed_pub:
+        # Phase 11.23: real Ed25519 signing key, used to verify the
+        # creator_signature field in v3 manifests.
+        methods.append({
+            "id": f"did:web:bottube.ai:{handle}#bottube-creator-key",
+            "type": "Ed25519VerificationKey2020",
+            "controller": f"did:web:bottube.ai:{handle}",
+            "publicKeyHex": ed_pub,
+            "purpose": "BoTTubeProvenanceV3",
+            "managed_by": "platform",
+            "note": (
+                "Server-managed Ed25519 keypair (v3a). Used to sign "
+                "creator_signature in /api/videos/<id>/provenance for "
+                "manifest_version >= 3. v3b will allow the agent to "
+                "bring their own keypair; the leaf shape stays the same."
+            ),
+        })
+    if rtc_addr:
+        methods.append({
+            "id": f"did:web:bottube.ai:{handle}#wallet",
+            "type": "Ed25519VerificationKey2020",
+            "controller": f"did:web:bottube.ai:{handle}",
+            "publicKey": rtc_addr,
+            "purpose": "RustChainWallet",
+            "note": "RustChain wallet address — separate from the "
+                    "BoTTubeProvenanceV3 signing key above.",
+        })
+    if methods:
+        actor_doc["verificationMethod"] = methods
+
+    resp = jsonify(actor_doc)
+    resp.headers["Content-Type"] = "application/did+json"
+    resp.headers["Cache-Control"] = "public, max-age=300"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+@app.route("/.well-known/mcp.json")
+def well_known_mcp():
+    """MCP discovery descriptor."""
+    resp = jsonify(_mcp_descriptor())
+    resp.headers["Cache-Control"] = "public, max-age=300"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# Phase 11.22: /.well-known/provenance-spec.json
+# ---------------------------------------------------------------------------
+# A canonical, machine-readable spec for the cryptographic provenance
+# pipeline. Federation peers, crawlers, and verifier authors hit this one
+# URL instead of scraping the engineering page. spec_version is bumped
+# explicitly when any leaf recipe / endpoint contract changes — consumers
+# pin against it.
+
+@app.route("/.well-known/provenance-spec.json")
+def well_known_provenance_spec():
+    """Self-describing provenance spec for federation + tooling."""
+    spec = {
+        "spec": "bottube-provenance",
+        "spec_version": "1.0.0",
+        "issuer": "https://bottube.ai",
+        "current_manifest_version": MANIFEST_CURRENT,
+        "leaf_recipes": {
+            "v1": _manifest_leaf_recipe(MANIFEST_V1),
+            "v2": _manifest_leaf_recipe(MANIFEST_V2),
+        },
+        "merkle": {
+            "tree_construction": (
+                "Bitcoin-style binary tree over SHA-256 leaves: pair "
+                "adjacent leaves and hash, duplicate the last node when "
+                "a level has odd cardinality, iterate until a single "
+                "32-byte root remains."
+            ),
+            "leaf_hash": "SHA-256",
+            "node_hash": "SHA-256",
+            "domain_separator": {
+                "v1": "(none — legacy)",
+                "v2": '"bottube/v2" (literal ASCII)',
+            },
+        },
+        "anchor": {
+            "chain": "rustchain",
+            "anchor_target": "Ergo box additionalRegisters.R4",
+            "register_format": "0e20<32-byte SHA-256 hex>",
+            "tx_value_nanoerg": 1_000_000,
+            "fee_policy": "zero-fee chain config",
+        },
+        "endpoints": {
+            "provenance":   "/api/videos/{video_id}/provenance",
+            "anchor_proof": "/api/videos/{video_id}/anchor-proof",
+            "receipt":      "/api/videos/{video_id}/receipt",
+            "anchor_chain": "/api/anchors/{tx_hash}/chain",
+            "transparency": "/api/transparency",
+            "anchors_html": "/anchors",
+            "transparency_html": "/transparency",
+            "engineering_html": "/engineering",
+            "verification_badge_svg": "/badge/verified/{video_id}.svg",
+            "verification_iframe":    "/embed/verify/{video_id}",
+            "verification_js":        "/embed/bottube-verify.js",
+        },
+        "verifier": {
+            "package": "bottube-verify",
+            "minimum_version": "0.4.0",
+            "source": "https://github.com/Scottcjn/bottube",
+            "install": "pip install bottube-verify",
+            "modes": {
+                "live": "bottube-verify <video_id>",
+                "offline_receipt": "bottube-verify --receipt receipt.json",
+                "asset_recheck": "bottube-verify <video_id> --check-asset",
+            },
+            "exit_codes": {
+                "0": "PASS or PARTIAL",
+                "1": "FAIL or fetch error",
+            },
+        },
+        "reconciliation": {
+            "endpoint": "/api/admin/reconcile-anchors",
+            "cadence": "every 6 hours via systemd timer",
+            "summary_in": "/api/transparency.reconciliation",
+            "alarm_field": "/api/transparency.reconciliation.alarm",
+        },
+        "federation": {
+            "actor_doc": "/.well-known/agent/{handle}",
+            "relay_key": "/.well-known/relay/key",
+            "firehose": "/xrpc/feed.firehose",
+        },
+        "schema_changes_policy": (
+            "spec_version bumps when any leaf recipe, anchor format, "
+            "endpoint contract, or receipt schema changes. Existing "
+            "anchors stay valid forever under the recipe they were "
+            "written under (manifest_version is per-row)."
+        ),
+        "as_of": int(time.time()),
+    }
+    resp = jsonify(spec)
+    resp.headers["Cache-Control"] = "public, max-age=600"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+@app.route("/mcp", methods=["GET", "POST", "OPTIONS"])
+def mcp_bridge():
+    """JSON-RPC-shaped MCP bridge.
+
+    Accepts:
+      * GET           -> returns the descriptor (same payload as /.well-known/mcp.json).
+      * POST {tool, args}  -> invokes the named tool, wraps the existing
+                              REST handler, returns its JSON response unwrapped
+                              with a {ok, tool, result} envelope.
+
+    No auth, read-only. Agents that want write access go through the
+    explicit /api/register + /api/agents/me/accept-terms flow.
+    """
+    if request.method == "OPTIONS":
+        resp = jsonify({"ok": True})
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        return resp
+
+    if request.method == "GET":
+        return jsonify(_mcp_descriptor())
+
+    data = request.get_json(silent=True) or {}
+    tool_name = (data.get("tool") or data.get("method") or "").strip()
+    args = data.get("args") or data.get("params") or {}
+    if not isinstance(args, dict):
+        return jsonify({"ok": False, "error": "args must be an object"}), 400
+
+    tool = next((t for t in MCP_TOOLS if t["name"] == tool_name), None)
+    if not tool:
+        return jsonify({
+            "ok": False,
+            "error": f"unknown tool: {tool_name}",
+            "available_tools": [t["name"] for t in MCP_TOOLS],
+        }), 404
+
+    # Use Flask's test_client so the full request lifecycle runs (before_request,
+    # visitor cookie, after_request) rather than test_request_context which
+    # leaves anchor IP empty and silently falls through to chronological.
+    try:
+        if tool_name == "feed.get":
+            qs = {k: str(args[k]) for k in ("bucket", "per_page", "page", "category")
+                  if k in args and args[k] not in (None, "")}
+            qs.setdefault("surface", "mcp")
+            with app.test_client() as client:
+                # Forge a stable visitor id per MCP-anchor video so anchor lookup
+                # has something to bite on. If args includes "anchor_video_id",
+                # use it as the visitor seed for deterministic recommendations.
+                anchor_seed = args.get("anchor_video_id", "") or "mcp_default"
+                visitor = "mcp_" + hashlib.sha256(anchor_seed.encode()).hexdigest()[:24]
+                client.set_cookie("_bt_vid", visitor)
+                r = client.get("/api/feed", query_string=qs)
+                payload = r.get_json()
+        elif tool_name == "video.get":
+            video_id = (args.get("video_id") or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_-]{5,32}", video_id):
+                return jsonify({"ok": False, "error": "invalid video_id"}), 400
+            db = get_db()
+            row = db.execute(
+                """SELECT v.video_id, v.title, v.description, v.tags, v.category,
+                          v.duration_sec, v.width, v.height, v.views, v.likes,
+                          v.dislikes, v.created_at, a.agent_name, a.display_name,
+                          a.avatar_url, a.is_human
+                     FROM videos v JOIN agents a ON v.agent_id = a.id
+                    WHERE v.video_id = ? AND COALESCE(v.is_removed, 0) = 0""",
+                (video_id,),
+            ).fetchone()
+            if not row:
+                return jsonify({"ok": False, "error": "video not found"}), 404
+            payload = {
+                "ok": True,
+                "video_id": row["video_id"],
+                "title": row["title"],
+                "description": row["description"],
+                "tags": (lambda t: json.loads(t) if t else [])(row["tags"]),
+                "category": row["category"],
+                "duration_sec": row["duration_sec"],
+                "width": row["width"],
+                "height": row["height"],
+                "views": row["views"],
+                "likes": row["likes"],
+                "dislikes": row["dislikes"],
+                "created_at": row["created_at"],
+                "agent_name": row["agent_name"],
+                "display_name": row["display_name"],
+                "avatar_url": row["avatar_url"],
+                "is_human": bool(row["is_human"]),
+                "watch_url": f"https://bottube.ai/watch/{row['video_id']}",
+                "stream_url": f"https://bottube.ai/api/videos/{row['video_id']}/stream",
+            }
+        elif tool_name == "video.similar":
+            video_id = (args.get("video_id") or "").strip()
+            try:
+                k = max(1, min(50, int(args.get("k", 10))))
+            except Exception:
+                k = 10
+            if not re.fullmatch(r"[A-Za-z0-9_-]{5,32}", video_id):
+                return jsonify({"ok": False, "error": "invalid video_id"}), 400
+            with app.test_request_context(
+                f"/api/videos/{video_id}/similar?k={k}",
+                headers={"X-MCP-Bridge": "1"},
+            ):
+                resp = api_videos_similar(video_id)
+                if isinstance(resp, tuple):
+                    resp = resp[0]
+                payload = resp.get_json() if hasattr(resp, "get_json") else resp
+        elif tool_name == "video.provenance":
+            video_id = (args.get("video_id") or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_-]{5,32}", video_id):
+                return jsonify({"ok": False, "error": "invalid video_id"}), 400
+            with app.test_request_context(
+                f"/api/videos/{video_id}/provenance",
+                headers={"X-MCP-Bridge": "1"},
+            ):
+                resp = video_provenance(video_id)
+                if isinstance(resp, tuple):
+                    resp = resp[0]
+                payload = resp.get_json() if hasattr(resp, "get_json") else resp
+        elif tool_name == "video.keyframes":
+            video_id = (args.get("video_id") or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_-]{5,32}", video_id):
+                return jsonify({"ok": False, "error": "invalid video_id"}), 400
+            with app.test_request_context(
+                f"/api/videos/{video_id}/keyframes",
+                headers={"X-MCP-Bridge": "1"},
+            ):
+                resp = video_keyframes(video_id)
+                if isinstance(resp, tuple):
+                    resp = resp[0]
+                payload = resp.get_json() if hasattr(resp, "get_json") else resp
+        else:
+            return jsonify({"ok": False, "error": f"unrouted tool: {tool_name}"}), 500
+
+        out = jsonify({"ok": True, "tool": tool_name, "result": payload})
+        out.headers["Access-Control-Allow-Origin"] = "*"
+        return out
+    except Exception as e:
+        try:
+            app.logger.warning("mcp bridge error %s: %s", tool_name, e)
+        except Exception:
+            pass
+        return jsonify({"ok": False, "tool": tool_name, "error": str(e)}), 500
+
+
+@app.route("/keyframes/<path:filename>")
+def serve_keyframe(filename):
+    """Serve keyframe sprite files with strong caching."""
+    if "/" in filename or ".." in filename:
+        abort(404)
+    return send_from_directory(
+        KEYFRAME_DIR, filename, max_age=86400 * 30, mimetype="image/jpeg"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Trust & Safety: TOS acceptance, content blocklist, user reports, audit
+# ---------------------------------------------------------------------------
+# Static legal pages, click-wrap acceptance for humans + explicit
+# acceptance flow for agents, hash-based content blocklist (SHA-256
+# of file + thumbnail), user-facing /api/report endpoint with rate
+# limiting, and a moderation_audit log of every enforcement action.
+
+TOS_VERSION = "1.0"
+TOS_EFFECTIVE = "2026-04-30"
+
+_TS_SCHEMA_READY = False
+_TS_SCHEMA_LOCK = _eng_Lock()
+
+
+def _ensure_ts_schema():
+    """Lazy create trust+safety tables and add TOS columns to agents."""
+    global _TS_SCHEMA_READY
+    if _TS_SCHEMA_READY:
+        return
+    with _TS_SCHEMA_LOCK:
+        if _TS_SCHEMA_READY:
+            return
+        conn = sqlite3.connect(str(DB_PATH))
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS moderation_reports (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    report_id     TEXT UNIQUE NOT NULL,
+                    category      TEXT NOT NULL,
+                    target        TEXT NOT NULL,
+                    detail        TEXT NOT NULL,
+                    reporter_email TEXT DEFAULT '',
+                    reporter_ip   TEXT DEFAULT '',
+                    reporter_ua   TEXT DEFAULT '',
+                    reporter_agent_id INTEGER DEFAULT 0,
+                    status        TEXT DEFAULT 'open',  -- open, reviewing, actioned, dismissed
+                    severity      TEXT DEFAULT 'normal', -- low, normal, high, critical
+                    handled_by    TEXT DEFAULT '',
+                    handled_at    REAL DEFAULT 0,
+                    resolution    TEXT DEFAULT '',
+                    created_at    REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_modreports_status
+                    ON moderation_reports(status, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_modreports_target
+                    ON moderation_reports(target);
+                CREATE INDEX IF NOT EXISTS idx_modreports_category
+                    ON moderation_reports(category, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS content_blocklist (
+                    hash_sha256   TEXT PRIMARY KEY,
+                    hash_kind     TEXT DEFAULT 'file',   -- file, thumbnail, phash
+                    category      TEXT NOT NULL,         -- csam, terror, ncii, copyright, malware, other
+                    source        TEXT DEFAULT '',       -- ncmec, iwf, projectvic, internal, user_report
+                    notes         TEXT DEFAULT '',
+                    added_by      TEXT DEFAULT '',
+                    added_at      REAL NOT NULL,
+                    hits          INTEGER DEFAULT 0,
+                    last_hit_at   REAL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_blocklist_category
+                    ON content_blocklist(category);
+
+                CREATE TABLE IF NOT EXISTS moderation_audit (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    actor         TEXT NOT NULL,        -- system, admin, user_report, ncmec
+                    action        TEXT NOT NULL,        -- quarantine, terminate, dismiss, restore, blocklist_add, ncmec_report
+                    target_kind   TEXT NOT NULL,        -- video, agent, ip, hash, comment
+                    target_id     TEXT NOT NULL,
+                    reason        TEXT DEFAULT '',
+                    severity      TEXT DEFAULT 'normal',
+                    metadata_json TEXT DEFAULT '{}',
+                    created_at    REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_audit_target
+                    ON moderation_audit(target_kind, target_id, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS agent_strikes (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_id      INTEGER NOT NULL,
+                    severity      TEXT NOT NULL,    -- minor, major, critical
+                    reason        TEXT NOT NULL,
+                    issued_by     TEXT DEFAULT 'system',
+                    expires_at    REAL DEFAULT 0,
+                    created_at    REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_strikes_agent
+                    ON agent_strikes(agent_id, created_at DESC);
+                """
+            )
+
+            # Add TOS columns to agents (idempotent).
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(agents)").fetchall()}
+            if "tos_version_accepted" not in cols:
+                conn.execute("ALTER TABLE agents ADD COLUMN tos_version_accepted TEXT DEFAULT ''")
+            if "tos_accepted_at" not in cols:
+                conn.execute("ALTER TABLE agents ADD COLUMN tos_accepted_at REAL DEFAULT 0")
+            if "tos_accepted_ip" not in cols:
+                conn.execute("ALTER TABLE agents ADD COLUMN tos_accepted_ip TEXT DEFAULT ''")
+            if "is_suspended" not in cols:
+                conn.execute("ALTER TABLE agents ADD COLUMN is_suspended INTEGER DEFAULT 0")
+            if "suspended_reason" not in cols:
+                conn.execute("ALTER TABLE agents ADD COLUMN suspended_reason TEXT DEFAULT ''")
+            if "suspended_at" not in cols:
+                conn.execute("ALTER TABLE agents ADD COLUMN suspended_at REAL DEFAULT 0")
+            conn.commit()
+        finally:
+            conn.close()
+        _TS_SCHEMA_READY = True
+
+
+def _ts_log_audit(actor, action, target_kind, target_id, reason="",
+                  severity="normal", meta=None):
+    """Append a moderation audit row. Never raises."""
+    try:
+        _ensure_ts_schema()
+        conn = sqlite3.connect(str(DB_PATH))
+        try:
+            conn.execute(
+                """INSERT INTO moderation_audit
+                       (actor, action, target_kind, target_id, reason, severity,
+                        metadata_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (actor, action, target_kind, target_id, reason, severity,
+                 json.dumps(meta or {}), time.time()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def _ts_check_blocklist(sha256_hex, kind="file"):
+    """Look up a hash in the content_blocklist. Returns the row or None."""
+    try:
+        _ensure_ts_schema()
+        db = get_db()
+        row = db.execute(
+            """SELECT hash_sha256, hash_kind, category, source, notes
+                 FROM content_blocklist WHERE hash_sha256 = ?""",
+            (sha256_hex,),
+        ).fetchone()
+        if row:
+            db.execute(
+                """UPDATE content_blocklist
+                      SET hits = COALESCE(hits, 0) + 1, last_hit_at = ?
+                    WHERE hash_sha256 = ?""",
+                (time.time(), sha256_hex),
+            )
+            db.commit()
+        return row
+    except Exception:
+        return None
+
+
+def _ts_sha256_file(path, chunk=1024 * 1024):
+    """SHA-256 a file on disk."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            buf = f.read(chunk)
+            if not buf:
+                break
+            h.update(buf)
+    return h.hexdigest()
+
+
+def _ts_suspend_agent(agent_id, reason, severity="critical"):
+    """Suspend an agent and log it. Caller still controls the response."""
+    try:
+        _ensure_ts_schema()
+        conn = sqlite3.connect(str(DB_PATH))
+        try:
+            conn.execute(
+                """UPDATE agents
+                      SET is_suspended = 1,
+                          suspended_reason = ?,
+                          suspended_at = ?
+                    WHERE id = ?""",
+                (reason, time.time(), agent_id),
+            )
+            conn.execute(
+                """INSERT INTO agent_strikes
+                       (agent_id, severity, reason, issued_by, created_at)
+                   VALUES (?, ?, ?, 'system', ?)""",
+                (agent_id, severity, reason, time.time()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    _ts_log_audit("system", "suspend", "agent", str(agent_id), reason, severity)
+
+
+def ts_inspect_uploaded_file(file_path, agent_id):
+    """Hash an uploaded file, check the blocklist. If matched, *quarantine*
+    (preserve under § 2258A), suspend the uploader, audit, and — for CSAM
+    — enqueue an NCMEC report for operator review.
+
+    Returns (rejected: bool, info: dict). Never raises.
+    """
+    try:
+        sha = _ts_sha256_file(file_path)
+    except Exception as e:
+        return False, {"hash_error": str(e)}
+
+    hit = _ts_check_blocklist(sha, kind="file")
+    if hit:
+        category = hit["category"]
+        critical = category in {"csam", "terror"}
+        try:
+            file_size = Path(file_path).stat().st_size
+        except Exception:
+            file_size = 0
+
+        # Snapshot upload provenance before we move the file. CSAM and
+        # other federal-reportable categories are *quarantined*, never
+        # deleted; § 2258A(h)(2)(A) requires 90-day preservation. For
+        # categories without a federal reporting duty we still preserve
+        # the file under quarantine so an operator can review.
+        ip = _get_client_ip()
+        ua = request.headers.get("User-Agent", "")[:500] if request else ""
+        agent_name = ""
+        agent_email = ""
+        try:
+            db = get_db()
+            row = db.execute(
+                "SELECT agent_name, COALESCE(email,'') AS email FROM agents WHERE id = ?",
+                (agent_id,),
+            ).fetchone()
+            if row:
+                agent_name = row["agent_name"] or ""
+                try:
+                    agent_email = row["email"] or ""
+                except Exception:
+                    agent_email = ""
+        except Exception:
+            pass
+
+        qpath = _ts_quarantine_file(
+            file_path, sha, category=category,
+            meta={
+                "agent_id": agent_id,
+                "agent_name": agent_name,
+                "ip": ip,
+                "user_agent": ua,
+                "blocklist_source": hit["source"],
+                "blocklist_kind": hit["hash_kind"],
+            },
+        )
+
+        _ts_suspend_agent(
+            agent_id,
+            reason=f"upload matched {category} blocklist (hash {sha[:16]}…)",
+            severity="critical" if critical else "major",
+        )
+        _ts_log_audit(
+            actor="system",
+            action="quarantine",
+            target_kind="upload",
+            target_id=sha,
+            reason=f"blocklist match: {category} (source={hit['source']})",
+            severity="critical" if critical else "major",
+            meta={"agent_id": agent_id, "kind": hit["hash_kind"],
+                  "quarantine_path": qpath, "ip": ip},
+        )
+
+        # CSAM and minor/NCII categories trigger an NCMEC report queue row.
+        # The operator drafts it from /admin/ncmec/queue and submits via
+        # report.cybertip.org until full ESP-API enrollment is active.
+        queue_id = ""
+        if category in {"csam", "ncii", "minor"}:
+            queue_id = _ncmec_enqueue(
+                source_type="blocklist_hit",
+                category=category,
+                target_kind="upload_attempt",
+                source_id=sha,
+                agent_id=agent_id,
+                agent_name=agent_name,
+                email=agent_email,
+                ip=ip,
+                user_agent=ua,
+                sha256=sha,
+                file_size=file_size,
+                quarantine_path=qpath,
+                discovery_method=f"sha256 match against {category}/{hit['source']} blocklist",
+                notes="Auto-enqueued at upload time by ts_inspect_uploaded_file.",
+            )
+
+        return True, {
+            "rejected": True,
+            "category": category,
+            "sha256": sha,
+            "quarantine_path": qpath,
+            "ncmec_queue_id": queue_id,
+        }
+    return False, {"sha256": sha}
+
+
+# --- Static legal pages ----------------------------------------------------
+
+@app.route("/terms")
+@app.route("/tos")
+def terms_page():
+    return render_template("terms.html",
+                           tos_version=TOS_VERSION,
+                           tos_effective=TOS_EFFECTIVE)
+
+
+@app.route("/aup")
+def aup_page():
+    return render_template("aup.html",
+                           tos_version=TOS_VERSION,
+                           tos_effective=TOS_EFFECTIVE)
+
+
+@app.route("/dmca")
+def dmca_page():
+    return render_template("dmca.html",
+                           tos_version=TOS_VERSION,
+                           tos_effective=TOS_EFFECTIVE)
+
+
+@app.route("/report")
+def report_page():
+    return render_template("report.html",
+                           tos_version=TOS_VERSION,
+                           tos_effective=TOS_EFFECTIVE)
+
+
+# Privacy template already exists in the templates dir; ensure a route exists.
+@app.route("/privacy")
+def privacy_page():
+    try:
+        return render_template("privacy.html",
+                               tos_version=TOS_VERSION,
+                               tos_effective=TOS_EFFECTIVE)
+    except Exception:
+        # Fallback if template variables differ
+        return render_template("privacy.html")
+
+
+# --- TOS acceptance for agents --------------------------------------------
+
+@app.route("/api/tos", methods=["GET"])
+def tos_metadata():
+    """Public TOS metadata for clients to discover the current version."""
+    return jsonify({
+        "ok": True,
+        "version": TOS_VERSION,
+        "effective": TOS_EFFECTIVE,
+        "terms_url": "https://bottube.ai/terms",
+        "aup_url": "https://bottube.ai/aup",
+        "dmca_url": "https://bottube.ai/dmca",
+        "privacy_url": "https://bottube.ai/privacy",
+        "report_url": "https://bottube.ai/report",
+        "csam_notice": (
+            "Zero tolerance for CSAM. Uploads are hash-checked and reported "
+            "to NCMEC and law enforcement as required by 18 U.S.C. § 2258A."
+        ),
+    })
+
+
+@app.route("/api/agents/me/accept-terms", methods=["POST"])
+@require_api_key
+def agent_accept_terms():
+    """Agent acknowledges the current Terms of Service.
+
+    Required before any write action by agents created after the TOS rollout.
+    Existing agents are grandfathered with a 30-day grace period.
+    """
+    _ensure_ts_schema()
+    data = request.get_json(silent=True) or {}
+    version = str(data.get("version", "")).strip() or TOS_VERSION
+    if version != TOS_VERSION:
+        return jsonify({
+            "ok": False,
+            "error": "version_mismatch",
+            "expected": TOS_VERSION,
+            "received": version,
+            "terms_url": "https://bottube.ai/terms",
+        }), 400
+
+    agent = g.agent
+    ip = _get_client_ip()
+    db = get_db()
+    db.execute(
+        """UPDATE agents
+              SET tos_version_accepted = ?,
+                  tos_accepted_at = ?,
+                  tos_accepted_ip = ?
+            WHERE id = ?""",
+        (version, time.time(), ip, agent["id"]),
+    )
+    db.commit()
+    _ts_log_audit("agent", "accept_terms", "agent", str(agent["id"]),
+                  reason=f"tos {version}", meta={"ip": ip})
+    return jsonify({
+        "ok": True,
+        "agent_name": agent["agent_name"],
+        "tos_version_accepted": version,
+        "tos_effective": TOS_EFFECTIVE,
+        "accepted_at": time.time(),
+        "message": (
+            "Terms of Service acknowledged. "
+            "Welcome — please read https://bottube.ai/aup before posting."
+        ),
+    })
+
+
+# --- Public report endpoint -----------------------------------------------
+
+@app.route("/api/report", methods=["POST"])
+def submit_report():
+    """User-facing report submission. Anonymous accepted, rate-limited per IP."""
+    _ensure_ts_schema()
+    ip = _get_client_ip()
+    if not _rate_limit(f"report:{ip}", 10, 3600):
+        return jsonify({"ok": False, "error": "Too many reports from this IP. Try again later."}), 429
+
+    data = request.get_json(silent=True) or {}
+    category = (data.get("category") or "").strip().lower()[:32]
+    target = (data.get("target") or "").strip()[:512]
+    detail = (data.get("detail") or "").strip()[:4000]
+    email = (data.get("email") or "").strip()[:200]
+
+    valid_cats = {"csam", "illegal", "ncii", "ip", "harassment",
+                  "impersonation", "malware", "spam", "minor", "other"}
+    if category not in valid_cats:
+        return jsonify({"ok": False, "error": "invalid category"}), 400
+    if not target or len(target) < 4:
+        return jsonify({"ok": False, "error": "target is required"}), 400
+    if not detail or len(detail) < 10:
+        return jsonify({"ok": False, "error": "detail must be at least 10 characters"}), 400
+
+    severity = "critical" if category in {"csam", "ncii"} else (
+        "high" if category in {"illegal", "minor", "malware"} else "normal"
+    )
+    report_id = "rpt_" + secrets.token_hex(8)
+    reporter_agent_id = (g.agent["id"] if getattr(g, "agent", None) else 0)
+
+    db = get_db()
+    db.execute(
+        """INSERT INTO moderation_reports
+               (report_id, category, target, detail,
+                reporter_email, reporter_ip, reporter_ua, reporter_agent_id,
+                severity, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (report_id, category, target, detail,
+         email, ip, request.headers.get("User-Agent", "")[:500], reporter_agent_id,
+         severity, time.time()),
+    )
+    db.commit()
+    _ts_log_audit("user_report", "submit", "report", report_id,
+                  reason=f"{category}: {target[:80]}", severity=severity,
+                  meta={"ip": ip, "agent_id": reporter_agent_id})
+
+    # CSAM, NCII, and minor-account reports auto-enqueue an NCMEC review.
+    # The status starts at "pending" so an operator must inspect, confirm
+    # apparent violation, draft from /admin/ncmec/draft, and submit. We do
+    # *not* auto-quarantine the target on a user report alone — that's a
+    # human-review decision to avoid weaponized takedowns.
+    ncmec_queue_id = ""
+    if category in {"csam", "ncii", "minor"}:
+        # Best-effort target lookup: extract a video id from the URL or
+        # fall back to the raw target string.
+        target_video_id = ""
+        m = re.search(r"/(?:watch|embed|v)/([A-Za-z0-9_-]{5,32})", target)
+        if m:
+            target_video_id = m.group(1)
+        elif re.fullmatch(r"[A-Za-z0-9_-]{5,32}", target):
+            target_video_id = target
+
+        involved_agent_id = 0
+        involved_agent_name = ""
+        if target_video_id:
+            try:
+                vrow = db.execute(
+                    """SELECT v.agent_id, a.agent_name
+                         FROM videos v JOIN agents a ON v.agent_id = a.id
+                        WHERE v.video_id = ?""",
+                    (target_video_id,),
+                ).fetchone()
+                if vrow:
+                    involved_agent_id = int(vrow["agent_id"] or 0)
+                    involved_agent_name = vrow["agent_name"] or ""
+            except Exception:
+                pass
+
+        ncmec_queue_id = _ncmec_enqueue(
+            source_type="user_report",
+            category=category,
+            target_kind="video" if target_video_id else "url",
+            target_video_id=target_video_id,
+            source_id=report_id,
+            agent_id=involved_agent_id,
+            agent_name=involved_agent_name,
+            ip="",  # the reporter's IP is not the involved party
+            user_agent="",
+            sha256="",
+            file_size=0,
+            quarantine_path="",
+            discovery_method=f"user report {report_id}",
+            notes=("Pending operator review. Confirm apparent violation, "
+                   "quarantine the file, then draft via /admin/ncmec/draft. "
+                   "Reporter detail: " + (detail[:300])),
+        )
+
+    out = {
+        "ok": True,
+        "report_id": report_id,
+        "severity": severity,
+        "message": (
+            "Report received. Thank you. CSAM and content depicting minors "
+            "is reviewed within 24 hours and forwarded to NCMEC where applicable."
+        ),
+    }
+    if ncmec_queue_id:
+        out["ncmec_queue_id"] = ncmec_queue_id
+    return jsonify(out)
+
+
+# --- Admin endpoints ------------------------------------------------------
+
+def _ts_admin_ok():
+    key = request.headers.get("X-Admin-Key", "") or request.args.get("admin_key", "")
+    expected = os.environ.get("BOTTUBE_ADMIN_KEY", "") or os.environ.get("RC_ADMIN_KEY", "")
+    return bool(expected) and (key == expected)
+
+
+@app.route("/admin/blocklist/add", methods=["POST"])
+def admin_blocklist_add():
+    """Admin: add a SHA-256 hash to the content blocklist."""
+    if not _ts_admin_ok():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    _ensure_ts_schema()
+    data = request.get_json(silent=True) or {}
+    sha = (data.get("sha256") or "").strip().lower()
+    category = (data.get("category") or "").strip().lower()
+    source = (data.get("source") or "internal").strip()[:64]
+    notes = (data.get("notes") or "").strip()[:500]
+    kind = (data.get("hash_kind") or "file").strip()[:32]
+
+    if not re.fullmatch(r"[0-9a-f]{64}", sha):
+        return jsonify({"ok": False, "error": "sha256 must be a 64-char hex string"}), 400
+    if category not in {"csam", "terror", "ncii", "ip", "malware", "other"}:
+        return jsonify({"ok": False, "error": "invalid category"}), 400
+
+    db = get_db()
+    db.execute(
+        """INSERT OR REPLACE INTO content_blocklist
+               (hash_sha256, hash_kind, category, source, notes, added_by, added_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (sha, kind, category, source, notes, "admin", time.time()),
+    )
+    db.commit()
+    _ts_log_audit("admin", "blocklist_add", "hash", sha,
+                  reason=f"{category} via {source}", severity="critical" if category == "csam" else "high")
+    return jsonify({"ok": True, "sha256": sha, "category": category, "added_at": time.time()})
+
+
+# --- Semantic embeddings (hybrid feed v1 scaffolding) ---------------------
+# Per-video text embedding via Gemini (gemini-embedding-001, 3072-d, L2-norm).
+# Cached in-memory as a NumPy matrix, refreshed lazily. Brute-force cosine
+# at query time — fine at the current ~1.4k-video scale; swap to Qdrant
+# once content is 10x larger. The /api/feed integration is deferred to
+# Phase 7; this phase ships the embedding store, helpers, and the
+# /api/videos/<id>/similar query surface.
+
+import urllib.request as _ue_urlreq
+import urllib.error as _ue_urlerr
+
+EMBEDDING_MODEL = "gemini-embedding-2"
+EMBEDDING_DIM = 3072
+EMBEDDING_API_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    + EMBEDDING_MODEL
+    + ":embedContent"
+)
+
+# In-memory cache for fast cosine similarity at query time.
+_EMB_CACHE = {"matrix": None, "ids": [], "loaded_at": 0.0}
+_EMB_CACHE_LOCK = _eng_Lock()
+
+# Free-tier Gemini embedContent quota is 100 requests/min/project. We
+# enforce a global ~80 RPM ceiling with a leaky-bucket gap of 0.75s
+# between successful calls, plus a 429-retry with the server-supplied
+# retryDelay. Concurrency stacks behind this gate so multiple workers
+# converge to the same rate.
+_EMB_RATE_LOCK = _eng_Lock()
+_EMB_RATE_NEXT_OK_AT = [0.0]
+_EMB_RATE_MIN_GAP = 0.75
+_EMB_RATE_429_BACKOFF_FLOOR = 5.0
+
+
+# --- Phase 11.3: visual signal (describe-then-embed) ----------------------
+# Per Codex's review, CLIP late-fusion is the right next modality. We don't
+# have a CLIP server running, so we use Gemini vision to describe each
+# keyframe sprite in 1-2 sentences, then embed the description with the
+# same gemini-embedding-2 model the text path uses.
+#
+# Why "describe-then-embed" over true CLIP:
+#   * Both signals end up in the same 3072-d Gemini space, so blending at
+#     query time is a simple weighted cosine, not a cross-space alignment
+#     problem.
+#   * The caption is auditable (stored verbatim in `caption` column) — a
+#     reviewer can see what the model thought the video was about.
+#   * No new inference infrastructure required; reuses APIs already wired.
+#
+# Two costs:
+#   * Gemini-2.5-flash vision rate limits (~15 RPM free tier, separate
+#     from the embedContent 100 RPM and 1000/day buckets).
+#   * Visual signal is filtered through a language layer, so very visual-
+#     only differences (e.g., color palette, motion direction) may be
+#     lost. Acceptable trade for a v1 that keeps the implementation tight.
+
+VISUAL_MODEL_VISION = "gemini-2.5-flash-lite"
+VISUAL_MODEL_EMBED = "gemini-embedding-2"
+VISUAL_API_VISION_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    + VISUAL_MODEL_VISION
+    + ":generateContent"
+)
+VISUAL_PROMPT = (
+    "Describe this 6-frame sprite from an AI-generated video clip in 1-2 "
+    "sentences. Focus on subject, action, visual style, and mood. No "
+    "headers or markdown — return just the description as plain text."
+)
+VISUAL_CAPTION_MAX_LEN = 600
+
+_UV_CACHE = {"matrix": None, "ids": [], "loaded_at": 0.0}
+_UV_CACHE_LOCK = _eng_Lock()
+
+# Vision quota is independent of the text embedContent quota but still
+# rate-limited; 4 s gap = 15 RPM, matches free-tier ceiling.
+_UV_RATE_LOCK = _eng_Lock()
+_UV_RATE_NEXT_OK_AT = [0.0]
+_UV_RATE_MIN_GAP = 4.0
+
+
+def _uv_ensure_schema():
+    """Lazy-create video_visual_embeddings table."""
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS video_visual_embeddings (
+                video_id        TEXT PRIMARY KEY,
+                vision_model    TEXT NOT NULL,            -- gemini-2.5-flash
+                embed_model     TEXT NOT NULL,            -- gemini-embedding-2
+                dim             INTEGER NOT NULL,
+                bytes           BLOB NOT NULL,            -- numpy float32 .tobytes()
+                caption         TEXT NOT NULL,            -- the visual description
+                sprite_sha      TEXT DEFAULT '',          -- sha256 of source sprite jpeg
+                created_at      REAL NOT NULL,
+                updated_at      REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_visual_embed_updated
+                ON video_visual_embeddings(updated_at DESC);
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _uv_rate_wait():
+    while True:
+        with _UV_RATE_LOCK:
+            now = time.time()
+            wait = _UV_RATE_NEXT_OK_AT[0] - now
+            if wait <= 0:
+                _UV_RATE_NEXT_OK_AT[0] = now + _UV_RATE_MIN_GAP
+                return
+        time.sleep(min(8.0, max(0.1, wait)))
+
+
+def _uv_describe_sprite(sprite_path):
+    """Call Gemini vision on a sprite jpeg. Returns (caption, error)."""
+    key = os.environ.get("GEMINI_API_KEY", "")
+    if not key:
+        return "", "no_api_key"
+    try:
+        with open(sprite_path, "rb") as f:
+            sprite_bytes = f.read()
+    except Exception as e:
+        return "", f"sprite_read_failed:{e}"
+    if not sprite_bytes:
+        return "", "empty_sprite"
+
+    import base64 as _b64
+    body = json.dumps({
+        "contents": [{
+            "parts": [
+                {"text": VISUAL_PROMPT},
+                {"inline_data": {
+                    "mime_type": "image/jpeg",
+                    "data": _b64.b64encode(sprite_bytes).decode("ascii"),
+                }},
+            ],
+        }],
+    }).encode("utf-8")
+    req = _ue_urlreq.Request(
+        VISUAL_API_VISION_URL + "?key=" + key,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    _uv_rate_wait()
+    try:
+        with _ue_urlreq.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except _ue_urlerr.HTTPError as e:
+        if e.code == 429:
+            try:
+                with _UV_RATE_LOCK:
+                    _UV_RATE_NEXT_OK_AT[0] = time.time() + 60.0
+            except Exception:
+                pass
+        return "", f"http_{e.code}"
+    except Exception as e:
+        return "", f"req_failed:{e}"
+
+    cands = data.get("candidates", []) or []
+    if not cands:
+        return "", "no_candidates"
+    parts = (cands[0].get("content", {}).get("parts", []) or [])
+    text = ""
+    for p in parts:
+        text += (p.get("text") or "")
+    text = text.strip()
+    if not text:
+        return "", "empty_caption"
+    return text[:VISUAL_CAPTION_MAX_LEN], ""
+
+
+def _uv_record_for_video(video_id, ensure_sprite=True):
+    """Generate or refresh the visual embedding for one video.
+
+    Steps:
+      1. Look up the video record + filename.
+      2. Ensure the keyframe sprite exists (generate on demand if missing).
+      3. Hash the sprite. If we already have a row with matching sprite_sha,
+         skip — same as the text path's text_sha guard.
+      4. Call Gemini vision for a description.
+      5. Embed the description with gemini-embedding-2.
+      6. INSERT OR REPLACE.
+    """
+    _uv_ensure_schema()
+    try:
+        import numpy as _np
+    except ImportError:
+        return {"ok": False, "error": "numpy_missing"}
+
+    db = get_db()
+    video = db.execute(
+        "SELECT video_id, filename, duration_sec FROM videos WHERE video_id = ? AND COALESCE(is_removed,0)=0",
+        (video_id,),
+    ).fetchone()
+    if not video:
+        return {"ok": False, "error": "not_found"}
+
+    sprite_path = KEYFRAME_DIR / f"{video_id}.jpg"
+    if not sprite_path.exists() or sprite_path.stat().st_size < 256:
+        if not ensure_sprite:
+            return {"ok": False, "error": "sprite_missing"}
+        if not _renditions_ffmpeg_available() and not Path("/usr/bin/ffmpeg").is_file():
+            return {"ok": False, "error": "ffmpeg_missing"}
+        # Reuse the existing extraction path
+        video_path = VIDEO_DIR / (video["filename"] or "")
+        if not video_path.exists():
+            return {"ok": False, "error": "canonical_missing"}
+        try:
+            _generate_keyframe_sprite(video_path, sprite_path)
+        except Exception as e:
+            return {"ok": False, "error": f"sprite_gen_failed:{e}"}
+
+    try:
+        sprite_sha = _ts_sha256_file(sprite_path)
+    except Exception as e:
+        return {"ok": False, "error": f"sprite_hash_failed:{e}"}
+
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        existing = conn.execute(
+            "SELECT sprite_sha FROM video_visual_embeddings WHERE video_id = ?",
+            (video_id,),
+        ).fetchone()
+        if existing and existing[0] == sprite_sha:
+            return {"ok": True, "skipped": True, "reason": "unchanged"}
+    finally:
+        conn.close()
+
+    caption, err = _uv_describe_sprite(str(sprite_path))
+    if err or not caption:
+        return {"ok": False, "error": f"describe_failed:{err}"}
+
+    arr = _ue_embed_text("Visual: " + caption)
+    if arr is None:
+        return {"ok": False, "error": "embed_failed"}
+    arr = arr.astype("float32", copy=False)
+
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        conn.execute(
+            """INSERT OR REPLACE INTO video_visual_embeddings
+                   (video_id, vision_model, embed_model, dim, bytes,
+                    caption, sprite_sha,
+                    created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?,
+                       COALESCE((SELECT created_at FROM video_visual_embeddings WHERE video_id=?), ?),
+                       ?)""",
+            (video_id, VISUAL_MODEL_VISION, VISUAL_MODEL_EMBED,
+             int(arr.shape[0]), arr.tobytes(), caption, sprite_sha,
+             video_id, time.time(), time.time()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with _UV_CACHE_LOCK:
+        _UV_CACHE.update({"matrix": None, "ids": [], "loaded_at": 0.0})
+    return {"ok": True, "dim": int(arr.shape[0]), "caption_len": len(caption)}
+
+
+def _uv_cache_warm():
+    try:
+        import numpy as _np
+    except ImportError:
+        return False
+    _uv_ensure_schema()
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """SELECT v.video_id, ve.dim, ve.bytes
+                 FROM video_visual_embeddings ve
+                 JOIN videos v ON v.video_id = ve.video_id
+                WHERE COALESCE(v.is_removed, 0) = 0
+                  AND ve.embed_model = ?
+                ORDER BY ve.video_id""",
+            (VISUAL_MODEL_EMBED,),
+        ).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        with _UV_CACHE_LOCK:
+            _UV_CACHE.update({"matrix": None, "ids": [], "loaded_at": time.time()})
+        return False
+    n = len(rows)
+    dim = int(rows[0]["dim"])
+    M = _np.zeros((n, dim), dtype=_np.float32)
+    ids = []
+    for i, r in enumerate(rows):
+        if int(r["dim"]) != dim:
+            continue
+        try:
+            M[i] = _np.frombuffer(r["bytes"], dtype=_np.float32)
+        except Exception:
+            continue
+        ids.append(r["video_id"])
+    with _UV_CACHE_LOCK:
+        _UV_CACHE.update({"matrix": M, "ids": ids, "loaded_at": time.time()})
+    return True
+
+
+@app.route("/admin/visual/backfill", methods=["POST"])
+def admin_visual_backfill():
+    """Generate visual embeddings for videos missing them. Resumable."""
+    if not _ts_admin_ok():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    _uv_ensure_schema()
+    data = request.get_json(silent=True) or {}
+    try:
+        limit = max(1, min(50, int(data.get("limit", 10))))
+    except Exception:
+        limit = 10
+    since = (data.get("since_video_id") or "").strip()
+
+    db = get_db()
+    targeted = data.get("video_ids") or []
+    if isinstance(targeted, list) and targeted:
+        # Targeted mode: explicit video_ids to (re)embed. Useful for seeding
+        # specific anchors or refreshing after a sprite changes.
+        ids_clean = [v for v in targeted if isinstance(v, str)
+                     and re.fullmatch(r"[A-Za-z0-9_-]{5,32}", v)][:limit]
+        if not ids_clean:
+            return jsonify({"ok": False, "error": "no valid video_ids"}), 400
+        ph = ",".join("?" for _ in ids_clean)
+        rows = db.execute(
+            f"""SELECT video_id FROM videos
+                 WHERE video_id IN ({ph})
+                   AND COALESCE(is_removed,0)=0
+                 ORDER BY video_id ASC""",
+            ids_clean,
+        ).fetchall()
+    elif since:
+        rows = db.execute(
+            """SELECT v.video_id
+                 FROM videos v
+                 LEFT JOIN video_visual_embeddings ve ON ve.video_id = v.video_id
+                WHERE COALESCE(v.is_removed, 0) = 0
+                  AND ve.video_id IS NULL
+                  AND v.video_id > ?
+                ORDER BY v.video_id ASC
+                LIMIT ?""",
+            (since, limit),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            """SELECT v.video_id
+                 FROM videos v
+                 LEFT JOIN video_visual_embeddings ve ON ve.video_id = v.video_id
+                WHERE COALESCE(v.is_removed, 0) = 0
+                  AND ve.video_id IS NULL
+                ORDER BY v.video_id ASC
+                LIMIT ?""",
+            (limit,),
+        ).fetchall()
+
+    started = time.time()
+    written, failed = 0, 0
+    last_id = ""
+    errors = []
+    sample_caption = ""
+    for r in rows:
+        last_id = r["video_id"]
+        result = _uv_record_for_video(r["video_id"])
+        if result.get("ok"):
+            written += 1
+            if result.get("skipped"):
+                pass
+            elif not sample_caption:
+                conn = sqlite3.connect(str(DB_PATH))
+                row = conn.execute(
+                    "SELECT caption FROM video_visual_embeddings WHERE video_id = ?",
+                    (r["video_id"],),
+                ).fetchone()
+                conn.close()
+                if row:
+                    sample_caption = (row[0] or "")[:200]
+        else:
+            failed += 1
+            if len(errors) < 10:
+                errors.append({"video_id": r["video_id"],
+                               "error": result.get("error", "unknown")})
+
+    elapsed = time.time() - started
+    return jsonify({
+        "ok": True,
+        "vision_model": VISUAL_MODEL_VISION,
+        "embed_model": VISUAL_MODEL_EMBED,
+        "written": written,
+        "failed": failed,
+        "elapsed_s": round(elapsed, 2),
+        "last_video_id": last_id,
+        "next_call": (
+            {"since_video_id": last_id, "limit": limit}
+            if rows and len(rows) >= limit else None
+        ),
+        "errors": errors,
+        "sample_caption": sample_caption,
+    })
+
+
+def _ue_ensure_schema():
+    """Lazy-create video_embeddings table."""
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS video_embeddings (
+                video_id     TEXT PRIMARY KEY,
+                model        TEXT NOT NULL,
+                dim          INTEGER NOT NULL,
+                bytes        BLOB NOT NULL,           -- numpy float32 .tobytes()
+                text_sha     TEXT DEFAULT '',         -- hash of source text; refresh if title/desc changes
+                created_at   REAL NOT NULL,
+                updated_at   REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_video_embeddings_updated
+                ON video_embeddings(updated_at DESC);
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _ue_text_for_video(video_row):
+    """Build the source text that gets embedded for a video.
+
+    Combines title + description + tags + scene_description + category
+    into a single short prompt. Title is weighted by repetition.
+    """
+    def _norm(s, n=400):
+        return (s or "").strip()[:n]
+
+    title = _norm(video_row.get("title", "") if isinstance(video_row, dict) else video_row["title"], 200)
+    desc = _norm(video_row.get("description", "") if isinstance(video_row, dict) else (video_row["description"] if "description" in video_row.keys() else ""))
+    scene = _norm(video_row.get("scene_description", "") if isinstance(video_row, dict) else (video_row["scene_description"] if "scene_description" in video_row.keys() else ""))
+    cat = _norm(video_row.get("category", "") if isinstance(video_row, dict) else (video_row["category"] if "category" in video_row.keys() else ""), 32)
+    tags_raw = video_row.get("tags", "[]") if isinstance(video_row, dict) else (video_row["tags"] if "tags" in video_row.keys() else "[]")
+    try:
+        tags = json.loads(tags_raw) if isinstance(tags_raw, str) else (tags_raw or [])
+    except Exception:
+        tags = []
+    tag_str = ", ".join(t for t in tags if isinstance(t, str))[:200]
+
+    # Title gets twice the weight via repetition; description and scene
+    # provide semantic ground.
+    parts = []
+    if title:
+        parts.append(f"Title: {title}")
+        parts.append(title)
+    if cat and cat != "other":
+        parts.append(f"Category: {cat}")
+    if desc:
+        parts.append(f"Description: {desc}")
+    if scene:
+        parts.append(f"Scene: {scene}")
+    if tag_str:
+        parts.append(f"Tags: {tag_str}")
+    return "\n".join(parts).strip() or (title or "(no metadata)")
+
+
+def _ue_rate_wait():
+    """Leaky-bucket throttle that keeps the project under the free-tier 100/min."""
+    while True:
+        with _EMB_RATE_LOCK:
+            now = time.time()
+            wait = _EMB_RATE_NEXT_OK_AT[0] - now
+            if wait <= 0:
+                _EMB_RATE_NEXT_OK_AT[0] = now + _EMB_RATE_MIN_GAP
+                return
+        time.sleep(min(2.0, max(0.05, wait)))
+
+
+def _ue_rate_back_off(seconds):
+    """Push the next-OK timestamp out after a 429."""
+    with _EMB_RATE_LOCK:
+        target = time.time() + max(_EMB_RATE_429_BACKOFF_FLOOR, float(seconds))
+        if target > _EMB_RATE_NEXT_OK_AT[0]:
+            _EMB_RATE_NEXT_OK_AT[0] = target
+
+
+def _ue_parse_retry_delay(http_error):
+    """Pull the retryDelay seconds out of a Gemini 429 response body."""
+    try:
+        body = http_error.read()
+        if isinstance(body, bytes):
+            body = body.decode("utf-8", errors="replace")
+        data = json.loads(body)
+        for d in (data.get("error", {}) or {}).get("details", []) or []:
+            if "RetryInfo" in (d.get("@type") or ""):
+                rd = d.get("retryDelay") or ""
+                m = re.match(r"^(\d+(?:\.\d+)?)s$", rd)
+                if m:
+                    return float(m.group(1))
+    except Exception:
+        pass
+    return _EMB_RATE_429_BACKOFF_FLOOR
+
+
+def _ue_embed_text(text, attempts=4):
+    """Call Gemini embedContent. Returns numpy float32 array or None on error.
+
+    Throttled to stay under 100 RPM (free-tier embed quota). On 429,
+    sleeps for the server-supplied retryDelay and retries.
+    """
+    if not text:
+        return None
+    key = os.environ.get("GEMINI_API_KEY", "")
+    if not key:
+        return None
+    body = json.dumps({
+        "content": {"parts": [{"text": text[:8000]}]},
+    }).encode("utf-8")
+    try:
+        import numpy as _np
+    except ImportError:
+        return None
+
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        _ue_rate_wait()
+        req = _ue_urlreq.Request(
+            EMBEDDING_API_URL + "?key=" + key,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with _ue_urlreq.urlopen(req, timeout=20) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            vals = data.get("embedding", {}).get("values") or []
+            if not vals:
+                return None
+            arr = _np.asarray(vals, dtype=_np.float32)
+            n = float(_np.linalg.norm(arr))
+            if n > 0:
+                arr = arr / n
+            return arr
+        except _ue_urlerr.HTTPError as e:
+            if e.code == 429:
+                delay = _ue_parse_retry_delay(e)
+                _ue_rate_back_off(delay)
+                last_err = e
+                continue
+            try:
+                app.logger.warning("gemini embed http %s", e)
+            except Exception:
+                pass
+            return None
+        except (_ue_urlerr.URLError, TimeoutError, OSError) as e:
+            last_err = e
+            time.sleep(min(8.0, 1.0 * attempt))
+            continue
+        except Exception as e:
+            try:
+                app.logger.warning("gemini embed error: %s", e)
+            except Exception:
+                pass
+            return None
+    try:
+        app.logger.warning("gemini embed gave up after %d attempts: %s", attempts, last_err)
+    except Exception:
+        pass
+    return None
+
+
+def _ue_text_sha(text):
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:24]
+
+
+def _ue_record_for_video(video_id, video_row=None):
+    """Compute and persist an embedding for a video. Idempotent on text_sha."""
+    _ue_ensure_schema()
+    try:
+        import numpy as _np
+    except ImportError:
+        return {"ok": False, "error": "numpy missing"}
+
+    if video_row is None:
+        db = get_db()
+        video_row = db.execute(
+            """SELECT video_id, title, description, tags, category, scene_description
+                 FROM videos WHERE video_id = ?""",
+            (video_id,),
+        ).fetchone()
+        if not video_row:
+            return {"ok": False, "error": "not_found"}
+
+    text = _ue_text_for_video(video_row)
+    text_sha = _ue_text_sha(text)
+
+    # Check existing row — skip only if text *and* model match the current
+    # config. Any mismatch (newer model, source-text edit) triggers a fresh
+    # embed so the row is replaced.
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        existing = conn.execute(
+            "SELECT text_sha, model FROM video_embeddings WHERE video_id = ?",
+            (video_id,),
+        ).fetchone()
+        if (existing
+                and existing[0] == text_sha
+                and existing[1] == EMBEDDING_MODEL):
+            return {"ok": True, "skipped": True, "reason": "unchanged"}
+    finally:
+        conn.close()
+
+    arr = _ue_embed_text(text)
+    if arr is None:
+        return {"ok": False, "error": "embed_failed"}
+    arr = arr.astype("float32", copy=False)
+
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        conn.execute(
+            """INSERT OR REPLACE INTO video_embeddings
+                   (video_id, model, dim, bytes, text_sha, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM video_embeddings WHERE video_id=?), ?), ?)""",
+            (video_id, EMBEDDING_MODEL, int(arr.shape[0]), arr.tobytes(),
+             text_sha, video_id, time.time(), time.time()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Invalidate the in-memory cache; lazy reload on next query.
+    with _EMB_CACHE_LOCK:
+        _EMB_CACHE["matrix"] = None
+        _EMB_CACHE["ids"] = []
+        _EMB_CACHE["loaded_at"] = 0.0
+    return {"ok": True, "dim": int(arr.shape[0]), "text_sha": text_sha}
+
+
+def _ue_record_for_video_async(video_id):
+    try:
+        threading.Thread(
+            target=_ue_record_for_video, args=(video_id,),
+            daemon=True, name=f"embed-{video_id}",
+        ).start()
+    except Exception as e:
+        try:
+            app.logger.warning("embed async dispatch failed: %s", e)
+        except Exception:
+            pass
+
+
+def _ue_cache_warm():
+    """Materialize the embedding matrix from disk into memory."""
+    try:
+        import numpy as _np
+    except ImportError:
+        return False
+    _ue_ensure_schema()
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """SELECT e.video_id, e.dim, e.bytes
+                 FROM video_embeddings e
+                 JOIN videos v ON v.video_id = e.video_id
+                WHERE COALESCE(v.is_removed, 0) = 0
+                  AND e.model = ?
+                ORDER BY e.video_id""",
+            (EMBEDDING_MODEL,),
+        ).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        with _EMB_CACHE_LOCK:
+            _EMB_CACHE.update({"matrix": None, "ids": [], "loaded_at": time.time()})
+        return False
+    n = len(rows)
+    dim = int(rows[0]["dim"])
+    M = _np.zeros((n, dim), dtype=_np.float32)
+    ids = []
+    for i, r in enumerate(rows):
+        if int(r["dim"]) != dim:
+            continue
+        try:
+            M[i] = _np.frombuffer(r["bytes"], dtype=_np.float32)
+        except Exception:
+            continue
+        ids.append(r["video_id"])
+    with _EMB_CACHE_LOCK:
+        _EMB_CACHE.update({"matrix": M, "ids": ids, "loaded_at": time.time()})
+    return True
+
+
+def _ue_top_k_for_video(video_id, k=10, exclude_self=True):
+    """Cosine top-K similar videos to `video_id`. Returns list of (video_id, score)."""
+    try:
+        import numpy as _np
+    except ImportError:
+        return []
+    with _EMB_CACHE_LOCK:
+        M = _EMB_CACHE.get("matrix")
+        ids = _EMB_CACHE.get("ids", [])
+        loaded = _EMB_CACHE.get("loaded_at", 0)
+    if M is None or not ids or (time.time() - loaded > 600):
+        _ue_cache_warm()
+        with _EMB_CACHE_LOCK:
+            M = _EMB_CACHE.get("matrix")
+            ids = _EMB_CACHE.get("ids", [])
+    if M is None or not ids:
+        return []
+
+    if video_id not in ids:
+        # Lazily compute on demand
+        result = _ue_record_for_video(video_id)
+        if not result.get("ok"):
+            return []
+        _ue_cache_warm()
+        with _EMB_CACHE_LOCK:
+            M = _EMB_CACHE.get("matrix")
+            ids = _EMB_CACHE.get("ids", [])
+        if video_id not in ids:
+            return []
+
+    idx = ids.index(video_id)
+    q = M[idx]
+    # Vectors are L2-normalized → cosine = dot product
+    sims = M @ q
+    # exclude self
+    if exclude_self:
+        sims[idx] = -1.0
+    k = max(1, min(k, len(ids)))
+    top_idx = _np.argpartition(-sims, k - 1)[:k]
+    top_idx = top_idx[_np.argsort(-sims[top_idx])]
+    return [(ids[int(i)], float(sims[int(i)])) for i in top_idx]
+
+
+@app.route("/api/videos/<video_id>/similar")
+def api_videos_similar(video_id):
+    """Top-K cosine-similar videos based on text embedding."""
+    try:
+        k = max(1, min(50, int(request.args.get("k", 10))))
+    except Exception:
+        k = 10
+    pairs = _ue_top_k_for_video(video_id, k=k, exclude_self=True)
+    if not pairs:
+        return jsonify({"ok": False, "error": "no_embeddings_yet", "video_id": video_id}), 404
+
+    db = get_db()
+    placeholders = ",".join("?" for _ in pairs)
+    rows = db.execute(
+        f"""SELECT v.video_id, v.title, v.thumbnail, v.duration_sec, v.views,
+                   v.created_at, a.agent_name, a.display_name, a.is_human
+              FROM videos v JOIN agents a ON v.agent_id = a.id
+             WHERE v.video_id IN ({placeholders})""",
+        [vid for vid, _ in pairs],
+    ).fetchall()
+    by_id = {r["video_id"]: r for r in rows}
+    out = []
+    for vid, score in pairs:
+        r = by_id.get(vid)
+        if not r:
+            continue
+        out.append({
+            "video_id": r["video_id"],
+            "title": r["title"],
+            "thumbnail": r["thumbnail"],
+            "duration_sec": r["duration_sec"],
+            "views": r["views"],
+            "created_at": r["created_at"],
+            "agent_name": r["agent_name"],
+            "display_name": r["display_name"],
+            "is_human": bool(r["is_human"]),
+            "score": round(score, 4),
+        })
+    return jsonify({
+        "ok": True,
+        "video_id": video_id,
+        "model": EMBEDDING_MODEL,
+        "count": len(out),
+        "results": out,
+    })
+
+
+@app.route("/admin/embeddings/backfill", methods=["POST"])
+def admin_embeddings_backfill():
+    """Backfill embeddings for videos missing one. Resumable, batched."""
+    if not _ts_admin_ok():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    _ue_ensure_schema()
+    data = request.get_json(silent=True) or {}
+    try:
+        limit = max(1, min(200, int(data.get("limit", 50))))
+    except Exception:
+        limit = 50
+    since = (data.get("since_video_id") or "").strip()
+    try:
+        concurrency = max(1, min(8, int(data.get("concurrency", 2))))
+    except Exception:
+        concurrency = 2
+
+    db = get_db()
+    if since:
+        rows = db.execute(
+            """SELECT v.video_id, v.title, v.description, v.tags, v.category, v.scene_description
+                 FROM videos v
+                 LEFT JOIN video_embeddings e
+                        ON e.video_id = v.video_id AND e.model = ?
+                WHERE COALESCE(v.is_removed, 0) = 0
+                  AND e.video_id IS NULL
+                  AND v.video_id > ?
+                ORDER BY v.video_id ASC
+                LIMIT ?""",
+            (EMBEDDING_MODEL, since, limit),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            """SELECT v.video_id, v.title, v.description, v.tags, v.category, v.scene_description
+                 FROM videos v
+                 LEFT JOIN video_embeddings e
+                        ON e.video_id = v.video_id AND e.model = ?
+                WHERE COALESCE(v.is_removed, 0) = 0
+                  AND e.video_id IS NULL
+                ORDER BY v.video_id ASC
+                LIMIT ?""",
+            (EMBEDDING_MODEL, limit),
+        ).fetchall()
+
+    started = time.time()
+    written, failed = 0, 0
+    last_id = ""
+    errors = []
+    if rows:
+        # Build dicts so the worker doesn't need a DB connection.
+        items = [{
+            "video_id": r["video_id"],
+            "title": r["title"], "description": r["description"],
+            "tags": r["tags"], "category": r["category"],
+            "scene_description": r["scene_description"],
+        } for r in rows]
+
+        with _cf2.ThreadPoolExecutor(max_workers=concurrency) as ex:
+            futs = {ex.submit(_ue_record_for_video, item["video_id"], item): item["video_id"] for item in items}
+            for fut in _cf2.as_completed(futs):
+                vid = futs[fut]
+                last_id = max(last_id, vid)
+                try:
+                    res = fut.result(timeout=60)
+                    if res and res.get("ok"):
+                        written += 1
+                    else:
+                        failed += 1
+                        if len(errors) < 10:
+                            errors.append({"video_id": vid, "error": (res or {}).get("error", "unknown")})
+                except Exception as e:
+                    failed += 1
+                    if len(errors) < 10:
+                        errors.append({"video_id": vid, "error": str(e)})
+
+    elapsed = time.time() - started
+    return jsonify({
+        "ok": True,
+        "model": EMBEDDING_MODEL,
+        "written": written,
+        "failed": failed,
+        "elapsed_s": round(elapsed, 2),
+        "last_video_id": last_id,
+        "next_call": (
+            {"since_video_id": last_id, "limit": limit, "concurrency": concurrency}
+            if rows and len(rows) >= limit else None
+        ),
+        "errors": errors,
+    })
+
+
+# --- NCMEC submission queue + quarantine -----------------------------------
+# 18 U.S.C. § 2258A obligates a "provider" to report apparent child sexual
+# abuse material to NCMEC's CyberTipline as soon as reasonably possible
+# after obtaining actual knowledge, and to preserve the content for 90 days
+# (§ 2258A(h)(2)(A)). This module:
+#   * Creates a quarantine directory and a metadata sidecar per incident.
+#   * Replaces the previous "unlink on match" behaviour with a move to
+#     quarantine, restricted file mode (0600), and an audit row.
+#   * Enqueues an NCMEC report row that the operator drafts and submits
+#     manually via report.cybertip.org until full ESP API enrollment is
+#     active.
+#
+# This is preparedness, not a CyberTipline integration: the actual
+# CyberTipline submission still happens through the human operator
+# pasting the generated packet into the NCMEC web form, with the NCMEC
+# report ID written back via /admin/ncmec/mark-submitted.
+
+QUARANTINE_DIR = BASE_DIR / "quarantine"
+
+
+def _ts_quarantine_dir():
+    """Create the quarantine dir on first use with restrictive perms."""
+    QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(QUARANTINE_DIR, 0o700)
+    except Exception:
+        pass
+    return QUARANTINE_DIR
+
+
+def _ts_ensure_ncmec_schema():
+    """Lazy-create ncmec_reports table. Idempotent."""
+    _ensure_ts_schema()  # piggyback on the broader trust+safety schema
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS ncmec_reports (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                queue_id            TEXT UNIQUE NOT NULL,
+                source_type         TEXT NOT NULL,        -- blocklist_hit, user_report, manual
+                source_id           TEXT DEFAULT '',      -- hash_sha256 OR moderation report_id
+                category            TEXT DEFAULT 'csam',  -- csam, ncii, minor (others may exist later)
+                target_kind         TEXT DEFAULT '',      -- video, upload_attempt, comment
+                target_video_id     TEXT DEFAULT '',
+                involved_agent_id   INTEGER DEFAULT 0,
+                involved_agent_name TEXT DEFAULT '',
+                involved_email      TEXT DEFAULT '',
+                involved_ip         TEXT DEFAULT '',
+                involved_user_agent TEXT DEFAULT '',
+                canonical_sha256    TEXT DEFAULT '',
+                file_size           INTEGER DEFAULT 0,
+                quarantine_path     TEXT DEFAULT '',      -- absolute path on disk
+                discovered_at       REAL NOT NULL,
+                discovery_method    TEXT DEFAULT '',
+                status              TEXT DEFAULT 'pending', -- pending, drafted, submitted, acknowledged, closed
+                ncmec_report_id     TEXT DEFAULT '',      -- assigned by NCMEC after submission
+                submitted_at        REAL DEFAULT 0,
+                submitted_by        TEXT DEFAULT '',
+                notes               TEXT DEFAULT '',
+                created_at          REAL NOT NULL,
+                updated_at          REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ncmec_status
+                ON ncmec_reports(status, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_ncmec_target
+                ON ncmec_reports(target_video_id);
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _ts_quarantine_file(src_path, sha, category="csam", meta=None):
+    """Move a flagged upload to the quarantine dir with restrictive perms.
+
+    Writes a JSON sidecar with discovery metadata. The original file is
+    *not* deleted — § 2258A(h) requires 90-day preservation. The caller is
+    responsible for separately invoking the NCMEC enqueue helper.
+
+    Returns the quarantine file path on success, "" on failure.
+    """
+    try:
+        qd = _ts_quarantine_dir()
+        ts = int(time.time())
+        # Predictable but unique filename: {category}_{sha8}_{epoch}.bin
+        qname = f"{category}_{sha[:12] if sha else 'unknown'}_{ts}.bin"
+        qpath = qd / qname
+        # Atomic-ish move; cross-fs fallback to copy+unlink.
+        try:
+            os.replace(str(src_path), str(qpath))
+        except OSError:
+            import shutil as _sh
+            _sh.copy2(str(src_path), str(qpath))
+            try:
+                Path(src_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        try:
+            os.chmod(qpath, 0o600)
+        except Exception:
+            pass
+        # Sidecar metadata
+        side = qpath.with_suffix(".json")
+        side.write_text(json.dumps({
+            "category": category,
+            "sha256": sha,
+            "src_path": str(src_path),
+            "quarantined_at": ts,
+            "preserve_until": ts + 86400 * 90,
+            "meta": meta or {},
+        }, indent=2))
+        try:
+            os.chmod(side, 0o600)
+        except Exception:
+            pass
+        return str(qpath)
+    except Exception as e:
+        try:
+            app.logger.error("quarantine failed: %s", e)
+        except Exception:
+            pass
+        return ""
+
+
+def _ncmec_enqueue(source_type, category="csam", target_kind="upload_attempt",
+                   target_video_id="", source_id="",
+                   agent_id=0, agent_name="", email="",
+                   ip="", user_agent="",
+                   sha256="", file_size=0, quarantine_path="",
+                   discovery_method="", notes=""):
+    """Insert a new NCMEC report queue row. Returns queue_id (or '')."""
+    try:
+        _ts_ensure_ncmec_schema()
+        queue_id = "ncmec_" + secrets.token_hex(8)
+        now = time.time()
+        conn = sqlite3.connect(str(DB_PATH))
+        try:
+            conn.execute(
+                """INSERT INTO ncmec_reports
+                       (queue_id, source_type, source_id, category, target_kind,
+                        target_video_id, involved_agent_id, involved_agent_name,
+                        involved_email, involved_ip, involved_user_agent,
+                        canonical_sha256, file_size, quarantine_path,
+                        discovered_at, discovery_method, status, notes,
+                        created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)""",
+                (queue_id, source_type, source_id, category, target_kind,
+                 target_video_id, agent_id, agent_name,
+                 email, ip, user_agent,
+                 sha256, file_size, quarantine_path,
+                 now, discovery_method, notes,
+                 now, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        _ts_log_audit("system", "ncmec_enqueue", "ncmec_report", queue_id,
+                      reason=f"{source_type}/{category}", severity="critical",
+                      meta={"target_video_id": target_video_id,
+                            "agent_id": agent_id, "sha256": sha256})
+        return queue_id
+    except Exception as e:
+        try:
+            app.logger.error("ncmec enqueue failed: %s", e)
+        except Exception:
+            pass
+        return ""
+
+
+def _ncmec_packet_text(row):
+    """Render a CyberTipline-style submission packet from a queue row.
+
+    The operator pastes this into report.cybertip.org until full ESP-API
+    enrollment is active. Field labels mirror the NCMEC web form sections.
+    """
+    def _fmt(t):
+        if not t:
+            return "(unknown)"
+        try:
+            return datetime.datetime.utcfromtimestamp(float(t)).strftime("%Y-%m-%d %H:%M:%S UTC")
+        except Exception:
+            return str(t)
+
+    sections = []
+    sections.append("NCMEC CyberTipline Submission Packet (DRAFT)")
+    sections.append("=" * 72)
+    sections.append(f"Queue ID:           {row['queue_id']}")
+    sections.append(f"Status:             {row['status']}")
+    sections.append(f"Discovered (UTC):   {_fmt(row['discovered_at'])}")
+    sections.append(f"Source type:        {row['source_type']}")
+    sections.append(f"Discovery method:   {row['discovery_method'] or '(unspecified)'}")
+    sections.append(f"Category:           {row['category']}")
+    sections.append("")
+
+    sections.append("REPORTING ELECTRONIC SERVICE PROVIDER")
+    sections.append("-" * 72)
+    sections.append("Name:               Elyan Labs (BoTTube)")
+    sections.append("Address:            Lake Charles, Louisiana, USA")
+    sections.append("Designated contact: abuse@elyanlabs.ai")
+    sections.append("Service URL:        https://bottube.ai")
+    sections.append("Statutory basis:    18 U.S.C. § 2258A — mandatory CyberTipline reporting.")
+    sections.append("Preservation:       File preserved on quarantine storage; will be retained")
+    sections.append("                    at least 90 days from discovery per § 2258A(h)(2)(A).")
+    sections.append("")
+
+    sections.append("INVOLVED PERSON / ACCOUNT")
+    sections.append("-" * 72)
+    sections.append(f"Agent name:         {row['involved_agent_name'] or '(unknown)'}")
+    sections.append(f"Internal agent id:  {row['involved_agent_id'] or '(unknown)'}")
+    sections.append(f"Account email:      {row['involved_email'] or '(unknown)'}")
+    sections.append(f"Originating IP:     {row['involved_ip'] or '(unknown)'}")
+    sections.append(f"User-Agent:         {row['involved_user_agent'] or '(unknown)'}")
+    sections.append("")
+
+    sections.append("INVOLVED CONTENT")
+    sections.append("-" * 72)
+    sections.append(f"Target kind:        {row['target_kind'] or '(unknown)'}")
+    sections.append(f"Target video id:    {row['target_video_id'] or '(none)'}")
+    sections.append(f"Public URL:         "
+                    + (f"https://bottube.ai/watch/{row['target_video_id']}"
+                       if row['target_video_id'] else "(blocked at upload — not published)"))
+    sections.append(f"Canonical SHA-256:  {row['canonical_sha256'] or '(unknown)'}")
+    sections.append(f"File size (bytes):  {row['file_size']}")
+    sections.append(f"Quarantine path:    {row['quarantine_path'] or '(not preserved — investigate)'}")
+    sections.append("")
+
+    sections.append("PROVIDER NOTES")
+    sections.append("-" * 72)
+    sections.append(row["notes"] or "(none)")
+    sections.append("")
+    sections.append("=" * 72)
+    sections.append("ACTION REQUIRED:")
+    sections.append("  1. Open https://report.cybertip.org and select 'Electronic Service Provider'.")
+    sections.append("  2. Paste the fields above into the corresponding form sections.")
+    sections.append("  3. Upload the quarantined file from the path above (do NOT redact hash or alter the file).")
+    sections.append("  4. After submission, NCMEC returns a Report ID. Record it via:")
+    sections.append("       POST /admin/ncmec/mark-submitted")
+    sections.append("       body: {\"queue_id\": \"" + row["queue_id"] + "\", \"ncmec_report_id\": \"<id>\"}")
+    sections.append("  5. Do not modify or delete the quarantined content for 90 days from the")
+    sections.append("     discovered date above (§ 2258A(h)(2)(A)). Cooperate with any law-enforcement")
+    sections.append("     preservation request.")
+    return "\n".join(sections) + "\n"
+
+
+@app.route("/admin/ncmec/queue")
+def admin_ncmec_queue():
+    """Pending NCMEC reports, ordered by oldest-first within severity."""
+    if not _ts_admin_ok():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    _ts_ensure_ncmec_schema()
+    db = get_db()
+    rows = db.execute(
+        """SELECT queue_id, source_type, category, target_video_id,
+                  involved_agent_name, canonical_sha256,
+                  status, ncmec_report_id, discovered_at, created_at
+             FROM ncmec_reports
+            WHERE status IN ('pending', 'drafted')
+            ORDER BY discovered_at ASC
+            LIMIT 200"""
+    ).fetchall()
+    return jsonify({
+        "ok": True,
+        "count": len(rows),
+        "queue": [
+            {
+                "queue_id": r["queue_id"],
+                "source_type": r["source_type"],
+                "category": r["category"],
+                "target_video_id": r["target_video_id"],
+                "involved_agent_name": r["involved_agent_name"],
+                "canonical_sha256": r["canonical_sha256"],
+                "status": r["status"],
+                "ncmec_report_id": r["ncmec_report_id"],
+                "discovered_at": r["discovered_at"],
+                "age_hours": round((time.time() - r["discovered_at"]) / 3600, 2),
+            } for r in rows
+        ],
+    })
+
+
+@app.route("/admin/ncmec/draft/<queue_id>")
+def admin_ncmec_draft(queue_id):
+    """Render a CyberTipline submission packet for an operator to paste."""
+    if not _ts_admin_ok():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    if not re.fullmatch(r"ncmec_[a-f0-9]{8,32}", queue_id):
+        return jsonify({"ok": False, "error": "invalid queue_id"}), 400
+    _ts_ensure_ncmec_schema()
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM ncmec_reports WHERE queue_id = ?",
+        (queue_id,),
+    ).fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "not found"}), 404
+
+    # Bump status to drafted on first read so the queue order is honest.
+    if row["status"] == "pending":
+        db.execute(
+            "UPDATE ncmec_reports SET status = 'drafted', updated_at = ? WHERE queue_id = ?",
+            (time.time(), queue_id),
+        )
+        db.commit()
+        _ts_log_audit("admin", "ncmec_draft", "ncmec_report", queue_id,
+                      reason="operator viewed draft", severity="high")
+
+    packet = _ncmec_packet_text(row)
+    return Response(packet, mimetype="text/plain", headers={
+        "Content-Disposition": f'attachment; filename="{queue_id}.txt"',
+        "Cache-Control": "no-store",
+    })
+
+
+@app.route("/admin/ncmec/mark-submitted", methods=["POST"])
+def admin_ncmec_mark_submitted():
+    """Operator records that a packet was filed with NCMEC; stores their report ID."""
+    if not _ts_admin_ok():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    _ts_ensure_ncmec_schema()
+    data = request.get_json(silent=True) or {}
+    queue_id = (data.get("queue_id") or "").strip()
+    ncmec_id = (data.get("ncmec_report_id") or "").strip()[:128]
+    submitter = (data.get("submitter") or "operator").strip()[:64]
+
+    if not re.fullmatch(r"ncmec_[a-f0-9]{8,32}", queue_id):
+        return jsonify({"ok": False, "error": "invalid queue_id"}), 400
+    if not ncmec_id:
+        return jsonify({"ok": False, "error": "ncmec_report_id required"}), 400
+
+    db = get_db()
+    row = db.execute(
+        "SELECT queue_id, status FROM ncmec_reports WHERE queue_id = ?", (queue_id,)
+    ).fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "not found"}), 404
+
+    db.execute(
+        """UPDATE ncmec_reports
+              SET status = 'submitted',
+                  ncmec_report_id = ?,
+                  submitted_at = ?,
+                  submitted_by = ?,
+                  updated_at = ?
+            WHERE queue_id = ?""",
+        (ncmec_id, time.time(), submitter, time.time(), queue_id),
+    )
+    db.commit()
+    _ts_log_audit("admin", "ncmec_submit", "ncmec_report", queue_id,
+                  reason=f"NCMEC id {ncmec_id}", severity="critical",
+                  meta={"submitter": submitter})
+    return jsonify({"ok": True, "queue_id": queue_id, "ncmec_report_id": ncmec_id})
+
+
+# --- Provenance write-path -------------------------------------------------
+# Populate video_provenance on every upload so the pill flips from gray
+# (unverified) to amber (pending) immediately. Anchor TX is filled in by
+# a separate Ergo anchor job; once both uploader_sig and anchor_tx_hash
+# are present, _build_provenance_payload() flips it to verified (green).
+
+def _provenance_signing_key():
+    """The platform secret used to sign canonical-asset manifests.
+
+    Falls back to BOTTUBE_SECRET_KEY (Flask session secret) if the
+    dedicated provenance key is unset. Both are HMAC keys, never exposed
+    to clients; only the resulting signature appears in the public JSON.
+    """
+    return (os.environ.get("BOTTUBE_PROVENANCE_KEY", "")
+            or os.environ.get("BOTTUBE_SECRET_KEY", "")
+            or "bottube-provenance-bootstrap")
+
+
+def _provenance_uploader_sig(video_id, canonical_sha256, agent_id, uploaded_at):
+    """HMAC-SHA256 platform signature over the canonical manifest line."""
+    key = _provenance_signing_key().encode("utf-8")
+    msg = f"{video_id}|{canonical_sha256}|{agent_id}|{int(uploaded_at)}".encode("utf-8")
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()
+
+
+def _provenance_optional_from_form(form):
+    """Pull optional generation metadata from the upload form.
+
+    All fields are optional. Agents that supply them get a richer pill;
+    legacy clients that don't get the same pending state with empty
+    generation block.
+    """
+    def _s(k, n=200):
+        return (form.get(k, "") or "").strip()[:n]
+    seed = 0
+    try:
+        seed = int(form.get("seed", "0") or 0)
+    except Exception:
+        seed = 0
+    generated_at = 0.0
+    try:
+        gen_at_raw = form.get("generated_at", "0") or 0
+        generated_at = float(gen_at_raw)
+    except Exception:
+        generated_at = 0.0
+    return {
+        "model": _s("gen_model", 64) or _s("model", 64),
+        "provider": _s("gen_provider", 64) or _s("provider", 64),
+        "workflow_hash": _s("workflow_hash", 128),
+        "prompt_hash": _s("prompt_hash", 128),
+        "seed": seed,
+        "generated_at": generated_at,
+    }
+
+
+# --- Phase 11.16: hash-tree v2 manifest ----------------------------------
+# v1 leaf:  sha256(video_id | canonical_sha256 | uploader_sig | uploaded_at)
+# v2 leaf:  sha256("bottube/v2"
+#                  | video_id
+#                  | canonical_sha256
+#                  | thumbnail_sha256
+#                  | canonical_360p_sha256
+#                  | uploader_sig
+#                  | uploaded_at)
+#
+# The "bottube/v2" prefix is a domain separator: a v1 leaf and a v2 leaf
+# can never collide even if all the other fields happen to match, because
+# the prefix differs. New uploads from this point write manifest_version=2;
+# existing v1 anchors stay anchored under v1's recipe and the verifier
+# branches on the manifest_version field.
+
+MANIFEST_V1 = 1
+MANIFEST_V2 = 2
+MANIFEST_V3 = 3
+MANIFEST_CURRENT = MANIFEST_V3  # what new uploads write
+
+_LEAF_DOMAIN_V2 = "bottube/v2"
+_LEAF_DOMAIN_V3 = "bottube/v3"
+
+# ---------------------------------------------------------------------------
+# Phase 11.23: Ed25519 creator signatures
+# ---------------------------------------------------------------------------
+# v3 manifest folds creator_pubkey + creator_signature into the leaf, so
+# the chain anchor commits not just to *what* was uploaded but to *who*
+# signed it. v3a (this iteration) uses server-managed keypairs — the
+# server maintains an Ed25519 keypair per agent, signs uploads on behalf
+# of the agent, and exposes the public key via /.well-known/agent/<handle>.
+# v3b (future) lets agents bring their own keypair and sign uploads
+# client-side; the server-side surface stays the same since v3 already
+# binds to creator_pubkey + creator_signature without caring who held
+# the private key.
+#
+# Even server-managed v3a is strictly better than HMAC:
+#   - Each agent has a unique keypair, not a shared platform secret
+#   - Public key is independently checkable via DID:web actor doc
+#   - The chain commits to a *verifiable* signature, not an opaque blob
+#   - Future migration to client-managed is purely additive
+
+try:
+    from nacl.signing import SigningKey, VerifyKey
+    from nacl.exceptions import BadSignatureError
+    _ED25519_AVAILABLE = True
+except Exception:
+    _ED25519_AVAILABLE = False
+
+
+def _agent_ed25519_signing_key():
+    """Master key used to encrypt agent Ed25519 private keys at rest.
+
+    Falls back to the provenance signing key. In server-managed v3a this
+    is the only secret needed to forge any creator signature; rotating it
+    is non-trivial and a known operational risk. Mitigation: client-managed
+    v3b removes this surface entirely.
+    """
+    return _provenance_signing_key()
+
+
+def _agent_ed25519_seal(seckey_bytes):
+    """Wrap a 32-byte Ed25519 seed with a derived key + AES-style XOR.
+
+    Sufficient against opportunistic disk read; not a real KMS. The
+    upgrade path is per-agent encryption with agent-supplied passphrases
+    or a real KMS — out of scope for v3a.
+    """
+    if not seckey_bytes:
+        return ""
+    master = hashlib.sha256(_agent_ed25519_signing_key().encode("utf-8")).digest()
+    out = bytes(b ^ master[i % len(master)] for i, b in enumerate(seckey_bytes))
+    return out.hex()
+
+
+def _agent_ed25519_unseal(sealed_hex):
+    if not sealed_hex:
+        return b""
+    try:
+        sealed = bytes.fromhex(sealed_hex)
+    except Exception:
+        return b""
+    master = hashlib.sha256(_agent_ed25519_signing_key().encode("utf-8")).digest()
+    return bytes(b ^ master[i % len(master)] for i, b in enumerate(sealed))
+
+
+def _agent_ensure_keypair(agent_id):
+    """Ensure agent has an Ed25519 keypair. Returns (pubkey_hex, seckey_bytes).
+
+    Idempotent: if the keypair already exists, returns the stored values.
+    Otherwise generates a fresh Ed25519 seed, stores the public key in
+    plaintext and the private key XOR-sealed with the platform key.
+    """
+    if not _ED25519_AVAILABLE:
+        return "", b""
+
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        # Idempotent column adds.
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(agents)").fetchall()}
+        if "ed25519_pubkey" not in cols:
+            conn.execute("ALTER TABLE agents ADD COLUMN ed25519_pubkey TEXT DEFAULT ''")
+        if "ed25519_seckey_sealed" not in cols:
+            conn.execute("ALTER TABLE agents ADD COLUMN ed25519_seckey_sealed TEXT DEFAULT ''")
+        if "ed25519_created_at" not in cols:
+            conn.execute("ALTER TABLE agents ADD COLUMN ed25519_created_at INTEGER DEFAULT 0")
+        conn.commit()
+
+        row = conn.execute(
+            "SELECT ed25519_pubkey, ed25519_seckey_sealed FROM agents WHERE id = ?",
+            (agent_id,),
+        ).fetchone()
+        if row and row[0] and row[1]:
+            return row[0], _agent_ed25519_unseal(row[1])
+
+        # Generate a fresh Ed25519 keypair.
+        signing = SigningKey.generate()
+        pubkey_hex = bytes(signing.verify_key).hex()
+        seckey_seed = bytes(signing)  # 32-byte seed
+        sealed = _agent_ed25519_seal(seckey_seed)
+
+        conn.execute(
+            """UPDATE agents
+                  SET ed25519_pubkey = ?,
+                      ed25519_seckey_sealed = ?,
+                      ed25519_created_at = ?
+                WHERE id = ?""",
+            (pubkey_hex, sealed, int(time.time()), agent_id),
+        )
+        conn.commit()
+        return pubkey_hex, seckey_seed
+    finally:
+        conn.close()
+
+
+def _agent_get_pubkey(agent_id):
+    """Return the agent's Ed25519 public key hex, or "" if none yet."""
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        try:
+            row = conn.execute(
+                "SELECT ed25519_pubkey FROM agents WHERE id = ?", (agent_id,),
+            ).fetchone()
+            return (row[0] or "") if row else ""
+        finally:
+            conn.close()
+    except Exception:
+        return ""
+
+
+def _v3_signing_message(video_id, canonical_sha256, thumbnail_sha256,
+                         canonical_360p_sha256, uploaded_at):
+    """The 32-byte digest that an agent (or the server on its behalf)
+    signs with Ed25519 for v3 provenance. Folded into the v3 leaf so the
+    chain anchor commits to the signature."""
+    parts = "|".join([
+        "bottube/v3-sign",
+        video_id or "",
+        canonical_sha256 or "",
+        thumbnail_sha256 or "",
+        canonical_360p_sha256 or "",
+        str(int(float(uploaded_at or 0))),
+    ])
+    return hashlib.sha256(parts.encode("utf-8")).digest()
+
+
+def _agent_sign_v3(agent_id, video_id, canonical_sha256,
+                   thumbnail_sha256, canonical_360p_sha256, uploaded_at):
+    """Server-managed v3 signing. Returns (pubkey_hex, signature_hex).
+
+    Used at upload time to produce a v3 manifest. v3b will replace this
+    with client-supplied signatures, but the leaf shape is unchanged.
+    Returns ("", "") if Ed25519 is unavailable so the caller can fall
+    back to v2 cleanly.
+    """
+    if not _ED25519_AVAILABLE:
+        return "", ""
+    pubkey_hex, seed = _agent_ensure_keypair(agent_id)
+    if not pubkey_hex or not seed:
+        return "", ""
+    msg = _v3_signing_message(
+        video_id, canonical_sha256,
+        thumbnail_sha256, canonical_360p_sha256,
+        uploaded_at,
+    )
+    try:
+        signing = SigningKey(seed)
+        signed = signing.sign(msg)
+        # signed.signature is 64 raw bytes
+        return pubkey_hex, signed.signature.hex()
+    except Exception:
+        return "", ""
+
+
+def _verify_v3_signature(pubkey_hex, signature_hex, video_id,
+                          canonical_sha256, thumbnail_sha256,
+                          canonical_360p_sha256, uploaded_at):
+    """Verify an Ed25519 signature against the v3 signing message."""
+    if not _ED25519_AVAILABLE:
+        return False
+    if not pubkey_hex or not signature_hex:
+        return False
+    try:
+        msg = _v3_signing_message(
+            video_id, canonical_sha256,
+            thumbnail_sha256, canonical_360p_sha256,
+            uploaded_at,
+        )
+        VerifyKey(bytes.fromhex(pubkey_hex)).verify(msg, bytes.fromhex(signature_hex))
+        return True
+    except (BadSignatureError, ValueError, Exception):
+        return False
+
+
+def _manifest_leaf_v1(video_id, canonical_sha256, uploader_sig, uploaded_at):
+    parts = "|".join([
+        video_id or "",
+        canonical_sha256 or "",
+        uploader_sig or "",
+        str(int(float(uploaded_at or 0))),
+    ])
+    return hashlib.sha256(parts.encode("utf-8")).digest()
+
+
+def _manifest_leaf_v2(video_id, canonical_sha256, thumbnail_sha256,
+                      canonical_360p_sha256, uploader_sig, uploaded_at):
+    parts = "|".join([
+        _LEAF_DOMAIN_V2,
+        video_id or "",
+        canonical_sha256 or "",
+        thumbnail_sha256 or "",
+        canonical_360p_sha256 or "",
+        uploader_sig or "",
+        str(int(float(uploaded_at or 0))),
+    ])
+    return hashlib.sha256(parts.encode("utf-8")).digest()
+
+
+def _manifest_leaf_v3(video_id, canonical_sha256, thumbnail_sha256,
+                       canonical_360p_sha256, uploader_sig, uploaded_at,
+                       creator_pubkey, creator_signature):
+    """v3 leaf: folds creator_pubkey + creator_signature so the chain
+    commits to a verifiable Ed25519 signature, not just a platform HMAC.
+    Backwards-incompatible with v2 by design — domain separator differs
+    so v2 and v3 leaves can never collide."""
+    parts = "|".join([
+        _LEAF_DOMAIN_V3,
+        video_id or "",
+        canonical_sha256 or "",
+        thumbnail_sha256 or "",
+        canonical_360p_sha256 or "",
+        uploader_sig or "",
+        creator_pubkey or "",
+        creator_signature or "",
+        str(int(float(uploaded_at or 0))),
+    ])
+    return hashlib.sha256(parts.encode("utf-8")).digest()
+
+
+def _manifest_leaf(version, video_id, canonical_sha256,
+                   thumbnail_sha256, canonical_360p_sha256,
+                   uploader_sig, uploaded_at,
+                   creator_pubkey="", creator_signature=""):
+    """Dispatch based on manifest version."""
+    v = int(version or 1)
+    if v >= MANIFEST_V3:
+        return _manifest_leaf_v3(
+            video_id, canonical_sha256,
+            thumbnail_sha256, canonical_360p_sha256,
+            uploader_sig, uploaded_at,
+            creator_pubkey, creator_signature,
+        )
+    if v >= MANIFEST_V2:
+        return _manifest_leaf_v2(video_id, canonical_sha256,
+                                  thumbnail_sha256, canonical_360p_sha256,
+                                  uploader_sig, uploaded_at)
+    return _manifest_leaf_v1(video_id, canonical_sha256, uploader_sig, uploaded_at)
+
+
+def _manifest_leaf_recipe(version):
+    v = int(version or 1)
+    if v >= MANIFEST_V3:
+        return (
+            'sha256("bottube/v3" | video_id | canonical_sha256 | '
+            'thumbnail_sha256 | canonical_360p_sha256 | uploader_sig | '
+            'creator_pubkey | creator_signature | uploaded_at) with "|" '
+            'as the literal separator. creator_signature is the hex-encoded '
+            '64-byte Ed25519 signature over '
+            'sha256("bottube/v3-sign" | video_id | canonical_sha256 | '
+            'thumbnail_sha256 | canonical_360p_sha256 | uploaded_at), '
+            'verifiable against creator_pubkey.'
+        )
+    if v >= MANIFEST_V2:
+        return (
+            'sha256("bottube/v2" | video_id | canonical_sha256 | '
+            'thumbnail_sha256 | canonical_360p_sha256 | uploader_sig | '
+            'uploaded_at) with "|" as the literal separator and uploaded_at '
+            'as integer seconds'
+        )
+    return (
+        "sha256(video_id | canonical_sha256 | uploader_sig | uploaded_at) "
+        "with '|' as the literal separator and uploaded_at as integer seconds"
+    )
+
+
+def _provenance_ensure_v2_columns():
+    """Add manifest_version + canonical_360p_sha256 columns idempotently."""
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(video_provenance)").fetchall()}
+        if "manifest_version" not in cols:
+            conn.execute("ALTER TABLE video_provenance ADD COLUMN manifest_version INTEGER DEFAULT 1")
+        if "canonical_360p_sha256" not in cols:
+            conn.execute("ALTER TABLE video_provenance ADD COLUMN canonical_360p_sha256 TEXT DEFAULT ''")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _provenance_ensure_v3_columns():
+    """Phase 11.23: add creator_signature column for v3 leaves.
+    creator_pubkey already exists from earlier phases."""
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(video_provenance)").fetchall()}
+        if "creator_signature" not in cols:
+            conn.execute("ALTER TABLE video_provenance ADD COLUMN creator_signature TEXT DEFAULT ''")
+        # creator_pubkey almost certainly exists, but defensively:
+        if "creator_pubkey" not in cols:
+            conn.execute("ALTER TABLE video_provenance ADD COLUMN creator_pubkey TEXT DEFAULT ''")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _provenance_thumbnail_sha(video_id, thumb_filename):
+    """SHA-256 of the served thumbnail file (best-effort)."""
+    if not thumb_filename:
+        return ""
+    try:
+        path = THUMB_DIR / thumb_filename
+        if not path.exists() or path.stat().st_size < 8:
+            return ""
+        return _ts_sha256_file(path)
+    except Exception:
+        return ""
+
+
+def _provenance_ensure_thumb_column():
+    """Idempotently add thumbnail_sha256 column to video_provenance."""
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(video_provenance)").fetchall()}
+        if "thumbnail_sha256" not in cols:
+            conn.execute("ALTER TABLE video_provenance ADD COLUMN thumbnail_sha256 TEXT DEFAULT ''")
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def _provenance_record_for_upload(video_id, canonical_path, agent, form,
+                                   width=0, height=0, duration=0.0,
+                                   uploaded_at=None):
+    """Compute SHA-256, sign, and INSERT into video_provenance.
+
+    Idempotent (REPLACE semantics). Never raises — provenance is best-effort
+    and an error here must not block the upload response.
+    """
+    try:
+        _ensure_provenance_schema()
+        _provenance_ensure_v2_columns()
+        _provenance_ensure_v3_columns()
+        if uploaded_at is None:
+            uploaded_at = time.time()
+        sha = _ts_sha256_file(canonical_path)
+        agent_id = agent["id"] if hasattr(agent, "__getitem__") else int(agent or 0)
+        sig = _provenance_uploader_sig(video_id, sha, agent_id, uploaded_at)
+        opt = _provenance_optional_from_form(form or {})
+
+        # Pull beacon_id / pubkey if columns exist on agents.
+        creator_pubkey = ""
+        creator_beacon = ""
+        try:
+            agent_keys = list(agent.keys()) if hasattr(agent, "keys") else []
+            if "rtc_wallet" in agent_keys:
+                creator_pubkey = agent["rtc_wallet"] or ""
+            if not creator_pubkey and "rtc_address" in agent_keys:
+                creator_pubkey = agent["rtc_address"] or ""
+            if "beacon_id" in agent_keys:
+                creator_beacon = agent["beacon_id"] or ""
+        except Exception:
+            pass
+
+        conn = sqlite3.connect(str(DB_PATH))
+        try:
+            # Phase 11.23: NEW uploads default to manifest_version=MANIFEST_CURRENT (v3).
+            # The pending-claim eligibility gates already require that
+            # canonical_360p_sha256 != '' AND creator_signature != '' before
+            # a v3 row can be claimed by the worker. So writing v3 here makes
+            # the row non-anchorable until the rendition pipeline finishes
+            # populating those fields — closing the upload→anchor race
+            # codex review identified.
+            conn.execute(
+                """INSERT OR REPLACE INTO video_provenance
+                       (video_id, canonical_sha256, duration_sec, width, height,
+                        creator_agent_id, creator_pubkey, creator_beacon_id,
+                        model, provider, workflow_hash, prompt_hash, seed,
+                        generated_at, uploader_sig, uploaded_at,
+                        anchor_chain, anchor_tx_hash, anchor_block_height,
+                        anchor_manifest_hash, parents_json, renditions_json,
+                        manifest_version,
+                        verified, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (video_id, sha, duration, width, height,
+                 agent_id, creator_pubkey, creator_beacon,
+                 opt["model"], opt["provider"], opt["workflow_hash"],
+                 opt["prompt_hash"], opt["seed"],
+                 opt["generated_at"] or uploaded_at, sig, uploaded_at,
+                 "", "", 0, "", "[]", "[]",
+                 MANIFEST_CURRENT,
+                 0, time.time(), time.time()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return {"ok": True, "sha256": sha, "uploader_sig": sig}
+    except Exception as e:
+        try:
+            app.logger.warning("provenance write failed for %s: %s", video_id, e)
+        except Exception:
+            pass
+        return {"ok": False, "error": str(e)}
+
+
+# --- Adaptive renditions + VMAF -------------------------------------------
+# Generate a 360p variant for the human-watch lane and compute VMAF
+# against the canonical 720x720 source. The result lands in
+# video_renditions and surfaces in the provenance side-sheet on every
+# /watch/<id> page. Encoding is async so uploads are not blocked.
+
+from threading import Semaphore as _eng_Semaphore
+import concurrent.futures as _cf2
+
+RENDITION_DIR = BASE_DIR / "renditions"
+RENDITION_FFMPEG = "/opt/ffmpeg-vmaf/ffmpeg"  # static build with libvmaf
+RENDITION_VMAF_MODEL = "version=vmaf_v0.6.1"  # bundled in the static build
+
+# Cap concurrent rendition jobs across all upload threads to keep the
+# VPS from getting starved on background ffmpeg.
+_RENDITION_GATE = _eng_Semaphore(2)
+_RENDITION_INFLIGHT = set()
+_RENDITION_INFLIGHT_LOCK = _eng_Lock()
+
+
+def _renditions_dir_for(video_id):
+    """Per-video subdir, created on demand."""
+    d = RENDITION_DIR / video_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _renditions_ffmpeg_available():
+    return Path(RENDITION_FFMPEG).is_file() and os.access(RENDITION_FFMPEG, os.X_OK)
+
+
+def _renditions_encode(canonical_path, out_path, target_w, target_h, crf=24, preset="medium"):
+    """Encode a downscale variant. Returns size in bytes (>0) on success, 0 on failure."""
+    out_path = str(out_path)
+    cmd = [
+        RENDITION_FFMPEG, "-loglevel", "error", "-y",
+        "-i", str(canonical_path),
+        "-vf", f"scale={target_w}:{target_h}:flags=bicubic",
+        "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        "-an",
+        out_path,
+    ]
+    try:
+        subprocess.run(cmd, check=True, timeout=120,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        sz = Path(out_path).stat().st_size
+        return sz
+    except subprocess.CalledProcessError as e:
+        try:
+            err = (e.stderr or b"").decode("utf-8", errors="replace")[:300]
+        except Exception:
+            err = ""
+        app.logger.warning("rendition encode failed: %s", err)
+        return 0
+    except subprocess.TimeoutExpired:
+        app.logger.warning("rendition encode timeout")
+        return 0
+
+
+def _renditions_compute_vmaf(distorted_path, ref_path, ref_width, ref_height,
+                             threads=2, timeout=180):
+    """Run libvmaf and return the mean score, or 0.0 on error.
+
+    Distorted is upscaled to reference dimensions before comparison
+    (standard practice — VMAF is computed at the reference resolution).
+    """
+    log_path = Path(distorted_path).with_suffix(".vmaf.json")
+    filter_chain = (
+        f"[0:v]scale={ref_width}:{ref_height}:flags=bicubic[d];"
+        f"[d][1:v]libvmaf=log_path={log_path}:log_fmt=json:n_threads={threads}:"
+        f"model={RENDITION_VMAF_MODEL}"
+    )
+    cmd = [
+        RENDITION_FFMPEG, "-loglevel", "error",
+        "-i", str(distorted_path),
+        "-i", str(ref_path),
+        "-lavfi", filter_chain,
+        "-f", "null", "-",
+    ]
+    try:
+        subprocess.run(cmd, check=True, timeout=timeout,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if not log_path.exists():
+            return 0.0
+        with open(log_path, "r") as f:
+            j = json.load(f)
+        pooled = j.get("pooled_metrics", {}).get("vmaf", {})
+        mean = float(pooled.get("mean", 0.0) or 0.0)
+        return mean
+    except subprocess.CalledProcessError as e:
+        try:
+            err = (e.stderr or b"").decode("utf-8", errors="replace")[:300]
+        except Exception:
+            err = ""
+        app.logger.warning("vmaf compute failed: %s", err)
+        return 0.0
+    except subprocess.TimeoutExpired:
+        app.logger.warning("vmaf compute timeout")
+        return 0.0
+    except Exception as e:
+        app.logger.warning("vmaf parse error: %s", e)
+        return 0.0
+    finally:
+        try:
+            log_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _renditions_upsert(video_id, label, url_path, width, height,
+                       bitrate_kbps, file_sha256, file_size, vmaf,
+                       is_canonical=False):
+    """Idempotent INSERT OR REPLACE into video_renditions."""
+    _ensure_provenance_schema()
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        conn.execute(
+            """INSERT OR REPLACE INTO video_renditions
+                   (video_id, label, url_path, width, height, bitrate_kbps,
+                    codec, file_sha256, file_size, vmaf, is_canonical, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'h264', ?, ?, ?, ?, ?)""",
+            (video_id, label, url_path, width, height, bitrate_kbps,
+             file_sha256, file_size, vmaf,
+             1 if is_canonical else 0, time.time()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _renditions_estimate_bitrate_kbps(file_path, duration_sec):
+    """Approximate bitrate from file size + duration."""
+    try:
+        size = Path(file_path).stat().st_size
+        if duration_sec and duration_sec > 0:
+            return int((size * 8) / 1000 / duration_sec)
+    except Exception:
+        pass
+    return 0
+
+
+def _renditions_process_video(video_id):
+    """Generate the 360p variant + canonical row for a single video.
+
+    Idempotent. If the rendition already exists on disk and in DB, returns fast.
+    Bounded concurrency via _RENDITION_GATE.
+    """
+    if not _renditions_ffmpeg_available():
+        app.logger.warning("renditions: static ffmpeg missing at %s", RENDITION_FFMPEG)
+        return {"ok": False, "error": "ffmpeg-vmaf not installed"}
+
+    # Coalesce concurrent calls for the same video
+    with _RENDITION_INFLIGHT_LOCK:
+        if video_id in _RENDITION_INFLIGHT:
+            return {"ok": False, "error": "in_flight"}
+        _RENDITION_INFLIGHT.add(video_id)
+
+    acquired = False
+    try:
+        if not _RENDITION_GATE.acquire(blocking=True, timeout=600):
+            return {"ok": False, "error": "gate_timeout"}
+        acquired = True
+
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.row_factory = sqlite3.Row
+        try:
+            video = conn.execute(
+                "SELECT video_id, filename, duration_sec, width, height "
+                "FROM videos WHERE video_id = ?",
+                (video_id,),
+            ).fetchone()
+            if not video:
+                return {"ok": False, "error": "not_found"}
+
+            canonical_path = VIDEO_DIR / (video["filename"] or "")
+            if not canonical_path.exists():
+                return {"ok": False, "error": "canonical_missing"}
+
+            ref_w = int(video["width"] or 720)
+            ref_h = int(video["height"] or 720)
+            duration = float(video["duration_sec"] or 0)
+
+            outdir = _renditions_dir_for(video_id)
+
+            # Register the canonical first (no VMAF — it IS the reference)
+            try:
+                canon_sha = _ts_sha256_file(canonical_path)
+            except Exception:
+                canon_sha = ""
+            canon_size = canonical_path.stat().st_size if canonical_path.exists() else 0
+            canon_kbps = _renditions_estimate_bitrate_kbps(canonical_path, duration)
+            _renditions_upsert(
+                video_id=video_id, label="canonical",
+                url_path=f"/api/videos/{video_id}/stream",
+                width=ref_w, height=ref_h, bitrate_kbps=canon_kbps,
+                file_sha256=canon_sha, file_size=canon_size, vmaf=0.0,
+                is_canonical=True,
+            )
+
+            # 360p downscale (square, since canonical is square)
+            target_dim = 360
+            p360_path = outdir / "360p.mp4"
+            need_encode = (
+                not p360_path.exists()
+                or p360_path.stat().st_size < 1024
+            )
+            if need_encode:
+                size = _renditions_encode(
+                    canonical_path, p360_path,
+                    target_w=target_dim, target_h=target_dim,
+                    crf=24, preset="medium",
+                )
+                if not size:
+                    return {"ok": False, "error": "encode_360_failed"}
+
+            # VMAF
+            vmaf_score = _renditions_compute_vmaf(
+                p360_path, canonical_path, ref_w, ref_h, threads=2,
+            )
+
+            try:
+                p360_sha = _ts_sha256_file(p360_path)
+            except Exception:
+                p360_sha = ""
+            p360_size = p360_path.stat().st_size
+            p360_kbps = _renditions_estimate_bitrate_kbps(p360_path, duration)
+
+            _renditions_upsert(
+                video_id=video_id, label="360p",
+                url_path=f"/renditions/{video_id}/360p.mp4",
+                width=target_dim, height=target_dim,
+                bitrate_kbps=p360_kbps,
+                file_sha256=p360_sha, file_size=p360_size,
+                vmaf=round(vmaf_score, 2), is_canonical=False,
+            )
+
+            # Phase 11.16 + 11.23: feed the 360p hash back into
+            # video_provenance AND atomically promote the row to v3 — but
+            # ONLY if the row hasn't been claimed by the anchor worker
+            # yet. Once anchor_status='claimed' the worker has frozen its
+            # snapshot of leaf inputs, and mutating the row here would
+            # silently desync the leaf.
+            #
+            # v3 promotion path:
+            #   1. Ensure the agent has an Ed25519 keypair
+            #   2. Compute creator_signature over the v3 signing message
+            #   3. Promote row to manifest_version=3 + write pubkey + sig
+            # If Ed25519 isn't available (PyNaCl missing), we silently
+            # downgrade to v2 — the rest of the pipeline still works.
+            if p360_sha:
+                try:
+                    _provenance_ensure_v2_columns()
+                    _provenance_ensure_v3_columns()
+                    # Pull the data we need to sign: agent_id + uploader fields
+                    conn_q = sqlite3.connect(str(DB_PATH))
+                    conn_q.row_factory = sqlite3.Row
+                    pre = conn_q.execute(
+                        """SELECT video_id, canonical_sha256, uploader_sig,
+                                  uploaded_at, creator_agent_id,
+                                  COALESCE(thumbnail_sha256, '') AS thumb,
+                                  COALESCE(manifest_version, 1) AS mv
+                             FROM video_provenance WHERE video_id = ?""",
+                        (video_id,),
+                    ).fetchone()
+                    conn_q.close()
+
+                    creator_pubkey, creator_sig = "", ""
+                    target_version = MANIFEST_V2  # default if Ed25519 fails
+                    if pre and _ED25519_AVAILABLE and pre["creator_agent_id"]:
+                        creator_pubkey, creator_sig = _agent_sign_v3(
+                            int(pre["creator_agent_id"]),
+                            video_id,
+                            pre["canonical_sha256"] or "",
+                            pre["thumb"] or "",
+                            p360_sha,
+                            pre["uploaded_at"] or 0,
+                        )
+                        if creator_pubkey and creator_sig:
+                            target_version = MANIFEST_V3
+
+                    conn_p = sqlite3.connect(str(DB_PATH))
+                    conn_p.execute(
+                        """UPDATE video_provenance
+                              SET canonical_360p_sha256 = ?,
+                                  manifest_version = ?,
+                                  creator_pubkey = COALESCE(NULLIF(?, ''), creator_pubkey),
+                                  creator_signature = ?,
+                                  updated_at = ?
+                            WHERE video_id = ?
+                              AND COALESCE(anchor_tx_hash, '') = ''
+                              AND COALESCE(anchor_status, 'pending')
+                                  IN ('pending', 'failed')""",
+                        (p360_sha, target_version,
+                         creator_pubkey, creator_sig,
+                         time.time(), video_id),
+                    )
+                    if conn_p.total_changes == 0:
+                        # Row already claimed/anchored — write the 360p
+                        # hash only, without changing leaf-affecting fields.
+                        conn_p.execute(
+                            """UPDATE video_provenance
+                                  SET canonical_360p_sha256 = ?,
+                                      updated_at = ?
+                                WHERE video_id = ?
+                                  AND COALESCE(canonical_360p_sha256, '') = ''""",
+                            (p360_sha, time.time(), video_id),
+                        )
+                    conn_p.commit()
+                    conn_p.close()
+                except Exception as _e:
+                    app.logger.warning("provenance 360p sha update failed for %s: %s",
+                                        video_id, _e)
+
+            return {
+                "ok": True, "video_id": video_id,
+                "vmaf_360p": round(vmaf_score, 2),
+                "size_360p": p360_size,
+                "kbps_360p": p360_kbps,
+            }
+        finally:
+            conn.close()
+    except Exception as e:
+        app.logger.warning("renditions process_video(%s) failed: %s", video_id, e)
+        return {"ok": False, "error": str(e)}
+    finally:
+        if acquired:
+            _RENDITION_GATE.release()
+        with _RENDITION_INFLIGHT_LOCK:
+            _RENDITION_INFLIGHT.discard(video_id)
+
+
+def _renditions_process_video_async(video_id):
+    """Fire-and-forget background dispatch."""
+    try:
+        threading.Thread(
+            target=_renditions_process_video, args=(video_id,),
+            daemon=True, name=f"rendition-{video_id}",
+        ).start()
+    except Exception as e:
+        app.logger.warning("renditions async dispatch failed: %s", e)
+
+
+@app.route("/renditions/<video_id>/<path:filename>")
+def serve_rendition(video_id, filename):
+    """Serve rendition files with strong caching."""
+    if "/" in filename or ".." in filename or "/" in video_id or ".." in video_id:
+        abort(404)
+    if not re.fullmatch(r"[A-Za-z0-9_-]{5,32}", video_id):
+        abort(404)
+    return send_from_directory(
+        RENDITION_DIR / video_id, filename, max_age=86400 * 30, mimetype="video/mp4",
+    )
+
+
+@app.route("/admin/renditions/backfill", methods=["POST"])
+def admin_renditions_backfill():
+    """Backfill renditions for videos missing a 360p rendition.
+
+    Body: {"limit": 30, "since_video_id": null, "concurrency": 2}.
+    Synchronous within the batch (each video ~7s — caller paginates).
+    """
+    if not _ts_admin_ok():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    if not _renditions_ffmpeg_available():
+        return jsonify({"ok": False, "error": "ffmpeg-vmaf not installed"}), 503
+    _ensure_provenance_schema()
+    data = request.get_json(silent=True) or {}
+    try:
+        limit = max(1, min(100, int(data.get("limit", 20))))
+    except Exception:
+        limit = 20
+    try:
+        concurrency = max(1, min(4, int(data.get("concurrency", 2))))
+    except Exception:
+        concurrency = 2
+    since = (data.get("since_video_id") or "").strip()
+
+    db = get_db()
+    if since:
+        rows = db.execute(
+            """SELECT v.video_id
+                 FROM videos v
+                 LEFT JOIN video_renditions r
+                        ON r.video_id = v.video_id AND r.label = '360p'
+                WHERE COALESCE(v.is_removed, 0) = 0
+                  AND r.video_id IS NULL
+                  AND v.video_id > ?
+                ORDER BY v.video_id ASC
+                LIMIT ?""",
+            (since, limit),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            """SELECT v.video_id
+                 FROM videos v
+                 LEFT JOIN video_renditions r
+                        ON r.video_id = v.video_id AND r.label = '360p'
+                WHERE COALESCE(v.is_removed, 0) = 0
+                  AND r.video_id IS NULL
+                ORDER BY v.video_id ASC
+                LIMIT ?""",
+            (limit,),
+        ).fetchall()
+
+    started = time.time()
+    written, failed = 0, 0
+    last_id = ""
+    samples = []  # collect VMAF for sanity
+    errors = []
+
+    if rows:
+        with _cf2.ThreadPoolExecutor(max_workers=concurrency) as ex:
+            futs = {ex.submit(_renditions_process_video, r["video_id"]): r["video_id"] for r in rows}
+            for fut in _cf2.as_completed(futs):
+                vid = futs[fut]
+                last_id = max(last_id, vid)
+                try:
+                    res = fut.result(timeout=300)
+                    if res and res.get("ok"):
+                        written += 1
+                        samples.append(res.get("vmaf_360p", 0.0))
+                    else:
+                        failed += 1
+                        if len(errors) < 10:
+                            errors.append({"video_id": vid, "error": (res or {}).get("error", "unknown")})
+                except Exception as e:
+                    failed += 1
+                    if len(errors) < 10:
+                        errors.append({"video_id": vid, "error": str(e)})
+
+    elapsed = time.time() - started
+    avg_vmaf = (sum(samples) / len(samples)) if samples else 0.0
+
+    return jsonify({
+        "ok": True,
+        "written": written,
+        "failed": failed,
+        "elapsed_s": round(elapsed, 2),
+        "avg_vmaf": round(avg_vmaf, 2),
+        "last_video_id": last_id,
+        "next_call": (
+            {"since_video_id": last_id, "limit": limit, "concurrency": concurrency}
+            if rows and len(rows) >= limit else None
+        ),
+        "errors": errors,
+    })
+
+
+# --- Phase 10.5: anchor batch lifecycle ----------------------------------
+# A pull-batch worker pattern, per Codex's Phase 10 review:
+#   * Bottube exposes GET /api/admin/provenance/pending — atomically
+#     claims a batch of unanchored manifests, returns them.
+#   * Worker cron (on node-2 / RustChain Ergo host) pulls hourly,
+#     computes a Merkle root of (video_id || canonical_sha256) leaves,
+#     anchors the root in a single Ergo box, POSTs the resulting
+#     tx_hash + block_height back to /api/admin/provenance/anchor-result.
+#   * Pills flip green only after a confirmed block height arrives.
+# Idempotent on batch_id so a retry of the callback can't double-write.
+
+def _provenance_ensure_anchor_columns():
+    """Idempotently add anchor_status and anchor_batch_id columns."""
+    _ensure_provenance_schema()
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(video_provenance)").fetchall()}
+        if "anchor_status" not in cols:
+            conn.execute(
+                "ALTER TABLE video_provenance ADD COLUMN anchor_status TEXT DEFAULT 'pending'"
+            )
+        if "anchor_batch_id" not in cols:
+            conn.execute(
+                "ALTER TABLE video_provenance ADD COLUMN anchor_batch_id TEXT DEFAULT ''"
+            )
+        if "anchored_at" not in cols:
+            conn.execute(
+                "ALTER TABLE video_provenance ADD COLUMN anchored_at REAL DEFAULT 0"
+            )
+        if "anchor_error" not in cols:
+            conn.execute(
+                "ALTER TABLE video_provenance ADD COLUMN anchor_error TEXT DEFAULT ''"
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@app.route("/api/admin/provenance/pending", methods=["GET", "POST"])
+def admin_provenance_pending():
+    """Claim a batch of unanchored manifests for the worker to anchor.
+
+    Atomically (in one transaction):
+      * Mints a batch_id.
+      * Selects up to `limit` rows with uploader_sig != '' AND anchor_tx_hash = ''
+        AND anchor_status IN ('pending', 'failed').
+      * Updates anchor_status='claimed', anchor_batch_id=<new id>.
+      * Returns the claimed rows + batch_id.
+
+    The worker is expected to either succeed (POST anchor-result) or
+    timeout, in which case the next claim treats stale 'claimed' rows
+    older than `claim_ttl` as eligible again.
+    """
+    if not _ts_admin_ok():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    _provenance_ensure_anchor_columns()
+    _provenance_ensure_v2_columns()
+    data = request.get_json(silent=True) or {}
+    try:
+        limit = max(1, min(500, int(data.get("limit", 100))))
+    except Exception:
+        limit = 100
+    try:
+        claim_ttl_s = max(60, int(data.get("claim_ttl_s", 3600)))
+    except Exception:
+        claim_ttl_s = 3600
+
+    batch_id = "batch_" + secrets.token_hex(8)
+    now = time.time()
+    stale_cutoff = now - claim_ttl_s
+
+    _provenance_ensure_v3_columns()
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            """SELECT video_id, canonical_sha256, uploader_sig, uploaded_at,
+                      creator_agent_id, model, generated_at,
+                      COALESCE(manifest_version, 1) AS manifest_version,
+                      COALESCE(thumbnail_sha256, '') AS thumbnail_sha256,
+                      COALESCE(canonical_360p_sha256, '') AS canonical_360p_sha256,
+                      COALESCE(creator_pubkey, '') AS creator_pubkey,
+                      COALESCE(creator_signature, '') AS creator_signature
+                 FROM video_provenance
+                WHERE uploader_sig != ''
+                  AND COALESCE(anchor_tx_hash, '') = ''
+                  AND (
+                        COALESCE(anchor_status, 'pending') IN ('pending', 'failed')
+                     OR (COALESCE(anchor_status, 'pending') = 'claimed'
+                         AND COALESCE(updated_at, 0) < ?)
+                      )
+                  AND (
+                        -- v2 / v3 rows only eligible once the rendition
+                        -- pipeline has filled in canonical_360p_sha256
+                        -- (v3 also requires creator_signature; gated below).
+                        COALESCE(manifest_version, 1) < 2
+                     OR COALESCE(canonical_360p_sha256, '') != ''
+                      )
+                  AND (
+                        -- Phase 11.23: v3 rows must additionally have a
+                        -- creator_signature. Without it the worker would
+                        -- anchor a v3 leaf with an empty signature field
+                        -- and the verifier would reject.
+                        COALESCE(manifest_version, 1) < 3
+                     OR COALESCE(creator_signature, '') != ''
+                      )
+                ORDER BY uploaded_at ASC
+                LIMIT ?""",
+            (stale_cutoff, limit),
+        ).fetchall()
+        if not rows:
+            conn.execute("COMMIT")
+            return jsonify({
+                "ok": True,
+                "batch_id": "",
+                "manifests": [],
+                "count": 0,
+                "message": "no manifests pending anchor",
+            })
+        ids = [r["video_id"] for r in rows]
+        placeholders = ",".join("?" for _ in ids)
+        conn.execute(
+            f"""UPDATE video_provenance
+                  SET anchor_status = 'claimed',
+                      anchor_batch_id = ?,
+                      updated_at = ?
+                WHERE video_id IN ({placeholders})""",
+            [batch_id, now] + ids,
+        )
+        conn.execute("COMMIT")
+    except Exception as e:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        return jsonify({"ok": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
+    manifests = []
+    for r in rows:
+        manifests.append({
+            "video_id": r["video_id"],
+            "canonical_sha256": r["canonical_sha256"],
+            "uploader_sig": r["uploader_sig"],
+            "uploaded_at": r["uploaded_at"],
+            "creator_agent_id": r["creator_agent_id"],
+            "creator_pubkey": r["creator_pubkey"] or "",
+            "creator_signature": r["creator_signature"] or "",
+            "model": r["model"] or "",
+            "generated_at": r["generated_at"] or 0,
+            # Phase 11.16/11.23: v2/v3 fields. Worker uses manifest_version
+            # to pick the correct leaf recipe; thumb / 360p / pubkey / sig
+            # default to empty strings on lower versions.
+            "manifest_version": int(r["manifest_version"] or 1),
+            "thumbnail_sha256": r["thumbnail_sha256"] or "",
+            "canonical_360p_sha256": r["canonical_360p_sha256"] or "",
+        })
+    return jsonify({
+        "ok": True,
+        "batch_id": batch_id,
+        "claimed_at": now,
+        "claim_ttl_s": claim_ttl_s,
+        "count": len(manifests),
+        "manifests": manifests,
+        "leaf_recipes": {
+            "v1": _manifest_leaf_recipe(MANIFEST_V1),
+            "v2": _manifest_leaf_recipe(MANIFEST_V2),
+            "v3": _manifest_leaf_recipe(MANIFEST_V3),
+        },
+    })
+
+
+# --- Phase 11.13: anchor confirmation reaper ------------------------------
+# After a TX is broadcast the worker reports block_height=0 if the chain
+# hasn't confirmed it yet. This endpoint re-queries the chain for every
+# unique anchor_tx_hash with block_height=0 and writes the real
+# inclusion height back. Driven by a separate systemd timer so the main
+# anchor cron stays single-purpose.
+
+@app.route("/api/admin/provenance/reap-confirmations", methods=["POST", "GET"])
+def admin_provenance_reap_confirmations():
+    """Update anchor_block_height on rows whose TX has now confirmed.
+
+    Strategy: SELECT DISTINCT anchor_tx_hash WHERE block_height=0. For
+    each one, query /wallet/transactionById on the configured Ergo node.
+    If the TX has at least 1 confirmation, derive inclusion height from
+    `inclusionHeight` (or chain_height - numConfirmations + 1 fallback)
+    and UPDATE every row in that batch.
+    """
+    if not _ts_admin_ok():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    _provenance_ensure_anchor_columns()
+
+    ergo_base = os.environ.get("ERGO_BASE", "http://localhost:19053")
+    ergo_key = os.environ.get("ERGO_API_KEY", "")
+    if not ergo_key:
+        return jsonify({"ok": False, "error": "ERGO_API_KEY not set"}), 503
+
+    try:
+        limit = max(1, min(200, int((request.args.get("limit") or
+                                     (request.get_json(silent=True) or {}).get("limit", 50)))))
+    except Exception:
+        limit = 50
+
+    db = get_db()
+    pending = db.execute(
+        """SELECT anchor_tx_hash, MIN(anchored_at) AS first_anchored_at
+             FROM video_provenance
+            WHERE COALESCE(anchor_tx_hash,'') != ''
+              AND COALESCE(anchor_block_height,0) = 0
+              AND anchor_chain != 'stub'
+            GROUP BY anchor_tx_hash
+            ORDER BY first_anchored_at ASC
+            LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    pending_txs = [r["anchor_tx_hash"] for r in pending]
+
+    updated_rows = 0
+    confirmed_txs = 0
+    failures = []
+    for tx_hash in pending_txs:
+        try:
+            req = urllib.request.Request(
+                f"{ergo_base}/wallet/transactionById?id={tx_hash}",
+                headers={"api_key": ergo_key},
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            failures.append({"tx": tx_hash, "error": f"HTTP {e.code}"})
+            continue
+        except Exception as e:
+            failures.append({"tx": tx_hash, "error": str(e)[:120]})
+            continue
+
+        num_confs = int((data or {}).get("numConfirmations", 0) or 0)
+        incl_height = int((data or {}).get("inclusionHeight", 0) or 0)
+        if num_confs < 1 or not incl_height:
+            failures.append({"tx": tx_hash, "error": f"unconfirmed ({num_confs} confs)"})
+            continue
+
+        n = db.execute(
+            """UPDATE video_provenance
+                  SET anchor_block_height = ?, updated_at = ?
+                WHERE anchor_tx_hash = ?
+                  AND COALESCE(anchor_block_height, 0) = 0""",
+            (incl_height, time.time(), tx_hash),
+        ).rowcount or 0
+        db.commit()
+        updated_rows += int(n)
+        confirmed_txs += 1
+
+    return jsonify({
+        "ok": True,
+        "scanned": len(pending_txs),
+        "confirmed_txs": confirmed_txs,
+        "rows_updated": updated_rows,
+        "failures": failures[:10],
+    })
+
+
+# ---------------------------------------------------------------------------
+# Phase 11.19: continuous anchor reconciliation
+# ---------------------------------------------------------------------------
+# A scheduled audit that bottube runs *against itself*: pick N random
+# already-anchored TXs, re-fetch R4 from chain, compare to the bottube DB.
+# If anything ever drifts (e.g., a corrupted DB write, a wrong manifest_hash
+# stored after a rollback), the next reconciliation pass surfaces it before
+# any user-facing verification breaks. Results land in
+# anchor_reconciliations and roll up into /api/transparency.
+
+def _reconciliation_ensure_schema():
+    """Idempotent table creation for the reconciliation log."""
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS anchor_reconciliations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tx_hash TEXT NOT NULL,
+                db_manifest_hash TEXT NOT NULL,
+                chain_r4_hex TEXT NOT NULL DEFAULT '',
+                chain_inclusion_height INTEGER DEFAULT 0,
+                chain_num_confirmations INTEGER DEFAULT 0,
+                matched INTEGER NOT NULL,
+                error TEXT NOT NULL DEFAULT '',
+                checked_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_recon_checked_at
+                ON anchor_reconciliations(checked_at)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_recon_matched
+                ON anchor_reconciliations(matched, checked_at)
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _fetch_chain_r4(ergo_base, ergo_key, tx_hash, timeout=10):
+    """Fetch the on-chain TX, return (r4_merkle_hex, inclusion_height,
+    num_confirmations, error). r4_merkle_hex is "" on any error."""
+    try:
+        req = urllib.request.Request(
+            f"{ergo_base}/wallet/transactionById?id={tx_hash}",
+            headers={"api_key": ergo_key} if ergo_key else {},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return "", 0, 0, f"HTTP {e.code}"
+    except Exception as e:
+        return "", 0, 0, str(e)[:160]
+
+    outs = (data or {}).get("outputs") or []
+    if not outs:
+        return "", 0, 0, "no outputs"
+    regs = outs[0].get("additionalRegisters") or {}
+    r4 = regs.get("R4", "")
+    merkle_hex = ""
+    if r4.startswith("0e20") and len(r4) == 4 + 64:
+        merkle_hex = r4[4:].lower()
+    return (
+        merkle_hex,
+        int(data.get("inclusionHeight") or 0),
+        int(data.get("numConfirmations") or 0),
+        "" if merkle_hex else "R4 not 32-byte SColl",
+    )
+
+
+@app.route("/api/admin/reconcile-anchors", methods=["POST", "GET"])
+def admin_reconcile_anchors():
+    """Re-verify N random anchored TXs against the chain.
+
+    For each: fetch R4, compare to DB anchor_manifest_hash, write the
+    result. Mismatches are alarms — they should never happen in a healthy
+    pipeline. Used by a 6-hour systemd timer; admin-key gated.
+
+    Body: {"limit": 50, "strategy": "random"|"recent"|"oldest"}.
+    """
+    if not _ts_admin_ok():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    _reconciliation_ensure_schema()
+    _provenance_ensure_anchor_columns()
+
+    data = request.get_json(silent=True) or {}
+    try:
+        limit = max(1, min(200, int(data.get("limit", 50))))
+    except Exception:
+        limit = 50
+    strategy = (data.get("strategy") or "random").lower()
+    if strategy not in ("random", "recent", "oldest"):
+        strategy = "random"
+
+    ergo_base = os.environ.get("ERGO_BASE", "http://localhost:19053")
+    ergo_key = os.environ.get("ERGO_API_KEY", "")
+    if not ergo_key:
+        return jsonify({"ok": False, "error": "ERGO_API_KEY not set"}), 503
+
+    db = get_db()
+    if strategy == "recent":
+        order = "anchored_at DESC"
+    elif strategy == "oldest":
+        order = "anchored_at ASC"
+    else:
+        order = "RANDOM()"
+    rows = db.execute(
+        f"""SELECT anchor_tx_hash AS tx_hash,
+                   MIN(anchor_manifest_hash) AS db_root,
+                   MIN(anchor_block_height) AS db_height
+              FROM video_provenance
+             WHERE COALESCE(anchor_tx_hash,'') != ''
+               AND COALESCE(anchor_block_height,0) > 0
+               AND anchor_chain != 'stub'
+             GROUP BY anchor_tx_hash
+             ORDER BY {order}
+             LIMIT ?""",
+        (limit,),
+    ).fetchall()
+
+    now = int(time.time())
+    scanned = 0
+    matched = 0
+    mismatched = 0
+    errored = 0
+    sample_mismatches = []
+    sample_errors = []
+
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        for row in rows:
+            scanned += 1
+            tx = row["tx_hash"]
+            db_root = (row["db_root"] or "").lower()
+            chain_root, incl_h, num_confs, err = _fetch_chain_r4(
+                ergo_base, ergo_key, tx,
+            )
+            if err and not chain_root:
+                errored += 1
+                if len(sample_errors) < 5:
+                    sample_errors.append({"tx": tx[:16] + "…", "error": err})
+                conn.execute(
+                    """INSERT INTO anchor_reconciliations
+                       (tx_hash, db_manifest_hash, chain_r4_hex,
+                        chain_inclusion_height, chain_num_confirmations,
+                        matched, error, checked_at)
+                       VALUES (?, ?, '', 0, ?, 0, ?, ?)""",
+                    (tx, db_root, num_confs, err, now),
+                )
+                continue
+
+            ok = (chain_root == db_root)
+            if ok:
+                matched += 1
+            else:
+                mismatched += 1
+                if len(sample_mismatches) < 5:
+                    sample_mismatches.append({
+                        "tx": tx,
+                        "db_root": db_root,
+                        "chain_root": chain_root,
+                    })
+            conn.execute(
+                """INSERT INTO anchor_reconciliations
+                   (tx_hash, db_manifest_hash, chain_r4_hex,
+                    chain_inclusion_height, chain_num_confirmations,
+                    matched, error, checked_at)
+                   VALUES (?, ?, ?, ?, ?, ?, '', ?)""",
+                (tx, db_root, chain_root, incl_h, num_confs,
+                 1 if ok else 0, now),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Mismatches are critical — log loudly.
+    if mismatched:
+        app.logger.error(
+            "ANCHOR RECONCILIATION MISMATCH: %d/%d txs do NOT match chain. "
+            "Sample: %s",
+            mismatched, scanned, sample_mismatches[:3],
+        )
+
+    return jsonify({
+        "ok": True,
+        "checked_at": now,
+        "strategy": strategy,
+        "scanned": scanned,
+        "matched": matched,
+        "mismatched": mismatched,
+        "errored": errored,
+        "sample_mismatches": sample_mismatches,
+        "sample_errors": sample_errors,
+        "alarm": mismatched > 0,
+    })
+
+
+def _reconciliation_summary():
+    """Roll up reconciliation_log into a small dict for /api/transparency."""
+    try:
+        _reconciliation_ensure_schema()
+    except Exception:
+        return None
+    db = get_db()
+    now = int(time.time())
+
+    def _count(sql, *args):
+        try:
+            r = db.execute(sql, args).fetchone()
+            return int((r or [0])[0] or 0)
+        except Exception:
+            return 0
+
+    last24 = now - 86400
+    last7d = now - 86400 * 7
+
+    total_24h = _count(
+        "SELECT COUNT(*) FROM anchor_reconciliations WHERE checked_at >= ?",
+        last24,
+    )
+    matched_24h = _count(
+        "SELECT COUNT(*) FROM anchor_reconciliations "
+        "WHERE checked_at >= ? AND matched = 1",
+        last24,
+    )
+    mismatched_24h = _count(
+        "SELECT COUNT(*) FROM anchor_reconciliations "
+        "WHERE checked_at >= ? AND matched = 0 AND error = ''",
+        last24,
+    )
+    errored_24h = _count(
+        "SELECT COUNT(*) FROM anchor_reconciliations "
+        "WHERE checked_at >= ? AND error != ''",
+        last24,
+    )
+    total_7d = _count(
+        "SELECT COUNT(*) FROM anchor_reconciliations WHERE checked_at >= ?",
+        last7d,
+    )
+    matched_7d = _count(
+        "SELECT COUNT(*) FROM anchor_reconciliations "
+        "WHERE checked_at >= ? AND matched = 1",
+        last7d,
+    )
+    mismatched_7d = _count(
+        "SELECT COUNT(*) FROM anchor_reconciliations "
+        "WHERE checked_at >= ? AND matched = 0 AND error = ''",
+        last7d,
+    )
+
+    last_check = None
+    last_mismatch = None
+    try:
+        r = db.execute(
+            "SELECT checked_at FROM anchor_reconciliations "
+            "ORDER BY checked_at DESC LIMIT 1"
+        ).fetchone()
+        last_check = int(r[0]) if r else None
+    except Exception:
+        pass
+    try:
+        r = db.execute(
+            "SELECT checked_at FROM anchor_reconciliations "
+            "WHERE matched = 0 AND error = '' "
+            "ORDER BY checked_at DESC LIMIT 1"
+        ).fetchone()
+        last_mismatch = int(r[0]) if r else None
+    except Exception:
+        pass
+
+    match_rate_24h = (matched_24h / (matched_24h + mismatched_24h)) if (matched_24h + mismatched_24h) else 1.0
+    match_rate_7d = (matched_7d / (matched_7d + mismatched_7d)) if (matched_7d + mismatched_7d) else 1.0
+
+    return {
+        "last_check_at": last_check,
+        "last_check_age_s": (now - last_check) if last_check else None,
+        "last_mismatch_at": last_mismatch,
+        "last_24h": {
+            "checked": total_24h,
+            "matched": matched_24h,
+            "mismatched": mismatched_24h,
+            "errored": errored_24h,
+            "match_rate": round(match_rate_24h, 4),
+        },
+        "last_7d": {
+            "checked": total_7d,
+            "matched": matched_7d,
+            "mismatched": mismatched_7d,
+            "match_rate": round(match_rate_7d, 4),
+        },
+        "alarm": mismatched_24h > 0,
+    }
+
+
+@app.route("/api/admin/provenance/anchor-result", methods=["POST"])
+def admin_provenance_anchor_result():
+    """Finalize a claimed batch with the on-chain anchor result.
+
+    Idempotent on batch_id: if the batch is already anchored, this is a
+    no-op success. If a callback arrives for a batch_id that doesn't
+    match the rows' current state, we log and refuse so a stale worker
+    can't overwrite a later successful anchor.
+    """
+    if not _ts_admin_ok():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    _provenance_ensure_anchor_columns()
+    data = request.get_json(silent=True) or {}
+    batch_id = (data.get("batch_id") or "").strip()
+    chain = (data.get("chain") or "ergo").strip()[:32]
+    tx_hash = (data.get("tx_hash") or "").strip()[:128]
+    try:
+        block_height = int(data.get("block_height", 0))
+    except Exception:
+        block_height = 0
+    manifest_hash = (data.get("merkle_root") or data.get("manifest_hash") or "").strip()[:128]
+    error_msg = (data.get("error") or "").strip()[:500]
+    video_ids = data.get("video_ids") or []
+
+    if not batch_id or not re.fullmatch(r"batch_[a-f0-9]{8,32}", batch_id):
+        return jsonify({"ok": False, "error": "invalid batch_id"}), 400
+
+    now = time.time()
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            """SELECT video_id, anchor_status, anchor_tx_hash
+                 FROM video_provenance
+                WHERE anchor_batch_id = ?""",
+            (batch_id,),
+        ).fetchall()
+        if not existing:
+            conn.execute("ROLLBACK")
+            return jsonify({"ok": False, "error": "batch_id has no claimed rows"}), 404
+
+        # Idempotency: if batch already anchored, return ok.
+        already = [r for r in existing if r["anchor_tx_hash"]]
+        if already and not error_msg:
+            conn.execute("ROLLBACK")
+            return jsonify({
+                "ok": True,
+                "idempotent": True,
+                "batch_id": batch_id,
+                "rows_already_anchored": len(already),
+            })
+
+        if error_msg:
+            # Worker reported failure — release the claim, keep status='failed'
+            conn.execute(
+                """UPDATE video_provenance
+                      SET anchor_status = 'failed',
+                          anchor_error = ?,
+                          updated_at = ?
+                    WHERE anchor_batch_id = ?""",
+                (error_msg, now, batch_id),
+            )
+            conn.execute("COMMIT")
+            return jsonify({
+                "ok": True,
+                "batch_id": batch_id,
+                "status": "failed",
+                "rows": len(existing),
+            })
+
+        if not tx_hash or not manifest_hash:
+            conn.execute("ROLLBACK")
+            return jsonify({
+                "ok": False,
+                "error": "tx_hash and merkle_root required for success result",
+            }), 400
+
+        # Apply the anchor result to all rows in this batch.
+        conn.execute(
+            """UPDATE video_provenance
+                  SET anchor_chain = ?,
+                      anchor_tx_hash = ?,
+                      anchor_block_height = ?,
+                      anchor_manifest_hash = ?,
+                      anchor_status = 'anchored',
+                      anchored_at = ?,
+                      anchor_error = '',
+                      updated_at = ?
+                WHERE anchor_batch_id = ?""",
+            (chain, tx_hash, block_height, manifest_hash, now, now, batch_id),
+        )
+        conn.execute("COMMIT")
+        rows_anchored = len(existing)
+    except Exception as e:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        return jsonify({"ok": False, "error": str(e)}), 500
+    finally:
+        conn.close()
+
+    _ts_log_audit(
+        actor="anchor_worker",
+        action="anchor_batch",
+        target_kind="batch",
+        target_id=batch_id,
+        reason=f"{rows_anchored} manifests anchored on {chain} block {block_height}",
+        severity="normal",
+        meta={"tx_hash": tx_hash, "merkle_root": manifest_hash},
+    )
+
+    return jsonify({
+        "ok": True,
+        "batch_id": batch_id,
+        "rows_anchored": rows_anchored,
+        "tx_hash": tx_hash,
+        "block_height": block_height,
+        "chain": chain,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Phase 11.5: public /anchors page — chain anchor history
+# ---------------------------------------------------------------------------
+# Read-only public surface that lists every Merkle anchor TX bottube has
+# committed to RustChain, with a per-batch detail page that lists members
+# and instructs how to run the verifier. This is what makes "Verified
+# Provenance" visible at the platform level, not just the per-video pill.
+
+def _anchors_summary(limit=200):
+    """Return a list of anchor batches grouped by tx_hash, newest first."""
+    db = get_db()
+    rows = db.execute(
+        """SELECT anchor_tx_hash AS tx_hash,
+                  MIN(anchor_chain) AS chain,
+                  MIN(anchor_block_height) AS block_height,
+                  MIN(anchor_manifest_hash) AS manifest_hash,
+                  MIN(anchor_batch_id) AS batch_id,
+                  MIN(anchored_at) AS anchored_at,
+                  COUNT(*) AS member_count
+             FROM video_provenance
+            WHERE COALESCE(anchor_tx_hash,'') != ''
+            GROUP BY anchor_tx_hash
+            ORDER BY anchored_at DESC
+            LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    return [{
+        "tx_hash": r["tx_hash"],
+        "chain": r["chain"] or "rustchain",
+        "block_height": r["block_height"] or 0,
+        "manifest_hash": r["manifest_hash"] or "",
+        "batch_id": r["batch_id"] or "",
+        "anchored_at": r["anchored_at"] or 0,
+        "member_count": r["member_count"] or 0,
+    } for r in rows]
+
+
+@app.route("/federation")
+def federation_page():
+    """Public federation spec — Codex's spec-first commitment."""
+    return render_template("federation.html")
+
+
+# ---------------------------------------------------------------------------
+# Phase 11.17: public transparency dashboard
+# ---------------------------------------------------------------------------
+# Operational honesty by default: anyone — including reviewers who don't have
+# admin access — can read live anchor lag, manifest version distribution,
+# pending backlog, federation peer count, and recent anchor cadence. Cached
+# in-memory for 60s so a hammered page doesn't beat up the DB.
+
+_TRANSPARENCY_CACHE = {"at": 0.0, "data": None}
+_TRANSPARENCY_TTL_S = 60.0
+
+
+def _percentiles(samples, ps=(0.5, 0.95, 0.99)):
+    """Closest-rank percentiles. Returns ints (seconds). [] -> 0s for all."""
+    if not samples:
+        return {f"p{int(p*100)}": 0 for p in ps}
+    s = sorted(samples)
+    out = {}
+    for p in ps:
+        idx = max(0, min(len(s) - 1, int(round(p * (len(s) - 1)))))
+        out[f"p{int(p*100)}"] = int(s[idx])
+    return out
+
+
+def _compute_transparency_snapshot():
+    """Compute the transparency dashboard payload from current DB state.
+
+    Read-only, side-effect-free. All counters are best-effort against the
+    operational SQLite — we explicitly do NOT promise atomic consistency,
+    only directional honesty (the v1/v2 ratio is real, the lag is real,
+    a stale 60s cache is acceptable for an external dashboard).
+    """
+    db = get_db()
+    now = int(time.time())
+
+    def _scalar(sql, *args, default=0):
+        try:
+            r = db.execute(sql, args).fetchone()
+            if r is None:
+                return default
+            v = r[0]
+            return v if v is not None else default
+        except Exception:
+            return default
+
+    total_anchored_rows = _scalar(
+        "SELECT COUNT(*) FROM video_provenance WHERE COALESCE(anchor_tx_hash,'') != ''"
+    )
+    total_anchor_txs = _scalar(
+        "SELECT COUNT(DISTINCT anchor_tx_hash) FROM video_provenance "
+        "WHERE COALESCE(anchor_tx_hash,'') != ''"
+    )
+    total_provenance_rows = _scalar(
+        "SELECT COUNT(*) FROM video_provenance"
+    )
+    pending_anchor = _scalar(
+        "SELECT COUNT(*) FROM video_provenance "
+        "WHERE COALESCE(anchor_tx_hash,'') = '' AND COALESCE(uploader_sig,'') != ''"
+    )
+    confirmed_anchors = _scalar(
+        "SELECT COUNT(DISTINCT anchor_tx_hash) FROM video_provenance "
+        "WHERE COALESCE(anchor_tx_hash,'') != '' "
+        "  AND COALESCE(anchor_block_height,0) > 0"
+    )
+    awaiting_confirmation = _scalar(
+        "SELECT COUNT(DISTINCT anchor_tx_hash) FROM video_provenance "
+        "WHERE COALESCE(anchor_tx_hash,'') != '' "
+        "  AND COALESCE(anchor_block_height,0) = 0 "
+        "  AND anchor_chain != 'stub'"
+    )
+
+    # Manifest version distribution. v2 should slowly take over once new
+    # uploads start landing. Surfaces v1→v2 rollout in real time.
+    v_rows = []
+    try:
+        v_rows = db.execute(
+            "SELECT COALESCE(manifest_version,1) AS v, "
+            "       COUNT(*) AS n FROM video_provenance "
+            " WHERE COALESCE(anchor_tx_hash,'') != '' "
+            " GROUP BY v"
+        ).fetchall()
+    except Exception:
+        v_rows = []
+    by_version = {int(r["v"]): int(r["n"]) for r in v_rows}
+
+    # Anchor cadence: last 24h, last 7d, last 30d (distinct TXs).
+    def _txs_since(seconds):
+        try:
+            return _scalar(
+                "SELECT COUNT(DISTINCT anchor_tx_hash) FROM video_provenance "
+                "WHERE COALESCE(anchor_tx_hash,'') != '' "
+                "  AND COALESCE(anchored_at, 0) >= ?",
+                now - seconds,
+            )
+        except Exception:
+            return 0
+
+    txs_24h = _txs_since(86400)
+    txs_7d = _txs_since(86400 * 7)
+    txs_30d = _txs_since(86400 * 30)
+
+    # Lag = upload-to-anchored, in seconds. Restrict to videos uploaded
+    # within the last 30 days so the percentile reflects *current*
+    # operational behavior — historical backfill anchors of long-old
+    # uploads would otherwise dominate the distribution.
+    lag_samples = []
+    try:
+        lag_rows = db.execute(
+            """SELECT (anchored_at - uploaded_at) AS lag_s
+                 FROM video_provenance
+                WHERE COALESCE(anchor_tx_hash,'') != ''
+                  AND COALESCE(anchored_at, 0) > 0
+                  AND COALESCE(uploaded_at, 0) > 0
+                  AND anchored_at > uploaded_at
+                  AND uploaded_at >= ?
+                ORDER BY anchored_at DESC
+                LIMIT 200""",
+            (now - 86400 * 30,),
+        ).fetchall()
+        lag_samples = [int(r["lag_s"]) for r in lag_rows
+                       if r["lag_s"] is not None and r["lag_s"] >= 0]
+    except Exception:
+        lag_samples = []
+    lag_p = _percentiles(lag_samples)
+
+    # Last anchor: most recent confirmed TX with non-zero block_height.
+    last_anchor = None
+    try:
+        r = db.execute(
+            """SELECT anchor_tx_hash, anchor_block_height, anchored_at,
+                      anchor_chain
+                 FROM video_provenance
+                WHERE COALESCE(anchor_tx_hash,'') != ''
+                  AND COALESCE(anchor_block_height,0) > 0
+                ORDER BY anchored_at DESC
+                LIMIT 1"""
+        ).fetchone()
+        if r:
+            last_anchor = {
+                "tx_hash": r["anchor_tx_hash"],
+                "block_height": int(r["anchor_block_height"] or 0),
+                "anchored_at": int(r["anchored_at"] or 0),
+                "chain": r["anchor_chain"] or "rustchain",
+                "age_s": max(0, now - int(r["anchored_at"] or 0)),
+            }
+    except Exception:
+        last_anchor = None
+
+    # Per-day anchor count for the last 14 days, oldest→newest, for a
+    # sparkline. Returned as [{"day": "YYYY-MM-DD", "count": N}].
+    daily = []
+    try:
+        rows = db.execute(
+            """SELECT date(anchored_at, 'unixepoch') AS day,
+                      COUNT(DISTINCT anchor_tx_hash) AS n
+                 FROM video_provenance
+                WHERE COALESCE(anchor_tx_hash,'') != ''
+                  AND COALESCE(anchored_at,0) >= ?
+                GROUP BY day
+                ORDER BY day ASC""",
+            (now - 86400 * 14,),
+        ).fetchall()
+        daily = [{"day": r["day"], "count": int(r["n"])} for r in rows]
+    except Exception:
+        daily = []
+
+    # Federation peer count if the table exists (best-effort — federation
+    # may be empty/disabled on a particular install).
+    federation_peers = 0
+    try:
+        federation_peers = _scalar(
+            "SELECT COUNT(*) FROM federation_peers WHERE COALESCE(active,0) = 1"
+        )
+    except Exception:
+        federation_peers = 0
+
+    # Verifier success: of the last 50 anchored TXs whose block_height>0,
+    # how many have a non-empty manifest_hash that's the canonical
+    # 32-byte hex? (A row that anchored but ended up with a blank or
+    # malformed manifest_hash would never verify and signals a bug.)
+    verifier_total = 0
+    verifier_ok = 0
+    try:
+        rows = db.execute(
+            """SELECT anchor_manifest_hash
+                 FROM video_provenance
+                WHERE COALESCE(anchor_tx_hash,'') != ''
+                  AND COALESCE(anchor_block_height,0) > 0
+                ORDER BY anchored_at DESC
+                LIMIT 50"""
+        ).fetchall()
+        for r in rows:
+            verifier_total += 1
+            mh = r["anchor_manifest_hash"] or ""
+            if len(mh) == 64 and re.fullmatch(r"[0-9a-f]+", mh):
+                verifier_ok += 1
+    except Exception:
+        pass
+    verifier_rate = (verifier_ok / verifier_total) if verifier_total else 1.0
+
+    try:
+        from datetime import datetime, timezone
+        as_of_iso = datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
+    except Exception:
+        as_of_iso = ""
+
+    # Phase 11.19: pull the latest reconciliation rollup. Best-effort —
+    # if the table doesn't exist yet (fresh deploy before first run), the
+    # summary helper returns None and the field is null.
+    try:
+        recon = _reconciliation_summary()
+    except Exception:
+        recon = None
+
+    return {
+        "ok": True,
+        "as_of": now,
+        "as_of_iso": as_of_iso,
+        "reconciliation": recon,
+        "anchors": {
+            "total_videos_anchored": total_anchored_rows,
+            "total_anchor_transactions": total_anchor_txs,
+            "confirmed_on_chain": confirmed_anchors,
+            "awaiting_confirmation": awaiting_confirmation,
+            "anchors_24h": txs_24h,
+            "anchors_7d": txs_7d,
+            "anchors_30d": txs_30d,
+            "last_anchor": last_anchor,
+            "anchor_lag_seconds": {
+                "samples": len(lag_samples),
+                "window_days": 30,
+                "note": (
+                    "upload→anchored seconds, sampled from videos uploaded "
+                    "in the last 30 days only — historical backfill anchors "
+                    "of older uploads are excluded so the percentile reflects "
+                    "current pipeline behavior"
+                ),
+                **lag_p,
+            },
+            "daily_14d": daily,
+        },
+        "manifest_versions": {
+            "by_version": {f"v{k}": v for k, v in sorted(by_version.items())},
+            "v2_share":
+                (by_version.get(2, 0) / total_anchored_rows)
+                if total_anchored_rows else 0.0,
+        },
+        "queue": {
+            "provenance_rows_total": total_provenance_rows,
+            "pending_anchor": pending_anchor,
+        },
+        "federation": {
+            "active_peers": federation_peers,
+        },
+        "verifier_health": {
+            "sample_size": verifier_total,
+            "well_formed_root_count": verifier_ok,
+            "well_formed_rate": round(verifier_rate, 4),
+        },
+        "spec_version": "phase-11.17",
+    }
+
+
+def _transparency_snapshot_cached():
+    """60s in-memory cache around the snapshot. Bounded server load."""
+    now = time.time()
+    if (_TRANSPARENCY_CACHE["data"] is not None
+            and (now - _TRANSPARENCY_CACHE["at"]) < _TRANSPARENCY_TTL_S):
+        return _TRANSPARENCY_CACHE["data"], True
+    fresh = _compute_transparency_snapshot()
+    _TRANSPARENCY_CACHE["at"] = now
+    _TRANSPARENCY_CACHE["data"] = fresh
+    return fresh, False
+
+
+@app.route("/api/transparency")
+def api_transparency():
+    """Public, read-only operational metrics for bottube.ai.
+
+    Documented purpose: a stable JSON contract that anyone — verifier
+    operators, federation peers, engineering reviewers, you with curl —
+    can poll to see how the platform is actually behaving. All fields
+    are best-effort directional honesty; no promise of atomic consistency.
+    """
+    data, cached = _transparency_snapshot_cached()
+    resp = jsonify(data)
+    resp.headers["Cache-Control"] = f"public, max-age={int(_TRANSPARENCY_TTL_S)}"
+    resp.headers["X-Bottube-Cache"] = "hit" if cached else "miss"
+    return resp
+
+
+@app.route("/transparency")
+def transparency_page():
+    """HTML rendering of /api/transparency for casual browsers."""
+    data, _cached = _transparency_snapshot_cached()
+    return render_template("transparency.html", t=data)
+
+
+@app.route("/verify")
+def verify_page():
+    """Phase 11.25: browser-side verifier. Walks the entire cryptographic
+    chain (provenance fields → Merkle leaf → inclusion proof → on-chain R4)
+    using SubtleCrypto.subtle.digest() in the user's browser. No install
+    required, no server-side trust beyond the public read-only endpoints.
+    """
+    return render_template("verify.html")
+
+
+@app.route("/api/anchors/<tx_hash>/chain")
+def anchor_chain_proxy(tx_hash):
+    """Public read-only proxy: fetch the on-chain TX from the configured Ergo
+    node and return the bits a verifier wants — R4 register, confirmations,
+    output value, ergoTree fingerprint. Lets the chain-side panel on
+    /anchors/<tx> render without exposing the operator's API key.
+    """
+    if not re.fullmatch(r"[0-9a-fA-F]{32,128}", tx_hash):
+        return jsonify({"ok": False, "error": "invalid tx_hash"}), 400
+    ergo_base = os.environ.get("ERGO_BASE", "http://localhost:19053")
+    ergo_key = os.environ.get("ERGO_API_KEY", "")
+    try:
+        req = urllib.request.Request(
+            f"{ergo_base}/wallet/transactionById?id={tx_hash}",
+            headers={"api_key": ergo_key} if ergo_key else {},
+        )
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"chain unreachable: {e}"}), 502
+    if not isinstance(data, dict) or "outputs" not in data:
+        return jsonify({"ok": False, "error": data.get("error", "no outputs")}), 404
+
+    outs = data.get("outputs") or []
+    out0 = outs[0] if outs else {}
+    regs = out0.get("additionalRegisters") or {}
+    r4 = regs.get("R4", "")
+    r5 = regs.get("R5", "")
+    # Decode R4 from "0e20" + 64-hex into the raw 32-byte hex root.
+    merkle = ""
+    if r4.startswith("0e20") and len(r4) == 4 + 64:
+        merkle = r4[4:]
+    return jsonify({
+        "ok": True,
+        "tx_hash": data.get("id", tx_hash),
+        "num_confirmations": int(data.get("numConfirmations", 0) or 0),
+        "inclusion_height": data.get("inclusionHeight"),
+        "output_count": len(outs),
+        "anchor_value_nanoerg": int(out0.get("value", 0) or 0),
+        "ergo_tree_short": (out0.get("ergoTree") or "")[:24],
+        "r4_raw": r4,
+        "r4_merkle_root": merkle,
+        "r5_raw": r5,
+        "creation_height": int(out0.get("creationHeight", 0) or 0),
+    })
+
+
+@app.route("/anchors")
+def anchors_page():
+    """Public chain anchor history."""
+    batches = _anchors_summary(limit=200)
+    total_anchored = sum(b["member_count"] for b in batches)
+    return render_template(
+        "anchors.html",
+        batches=batches,
+        total_anchored=total_anchored,
+        total_batches=len(batches),
+    )
+
+
+@app.route("/anchors/<tx_hash>")
+def anchor_detail_page(tx_hash):
+    """Per-batch detail: tx_hash, manifest_hash, all member videos, verifier hint."""
+    if not re.fullmatch(r"[0-9a-fA-F]{32,128}", tx_hash):
+        abort(404)
+    db = get_db()
+    rows = db.execute(
+        """SELECT v.video_id, v.title, v.thumbnail, v.duration_sec, v.created_at,
+                  a.agent_name, a.display_name,
+                  p.canonical_sha256, p.uploader_sig, p.uploaded_at,
+                  p.anchor_chain, p.anchor_tx_hash, p.anchor_block_height,
+                  p.anchor_manifest_hash, p.anchor_batch_id, p.anchored_at
+             FROM video_provenance p
+             JOIN videos v ON v.video_id = p.video_id
+             JOIN agents a ON a.id = v.agent_id
+            WHERE p.anchor_tx_hash = ?
+              AND COALESCE(v.is_removed, 0) = 0
+            ORDER BY p.uploaded_at ASC""",
+        (tx_hash,),
+    ).fetchall()
+    if not rows:
+        abort(404)
+    head = rows[0]
+    batch = {
+        "tx_hash": head["anchor_tx_hash"],
+        "chain": head["anchor_chain"] or "rustchain",
+        "block_height": head["anchor_block_height"] or 0,
+        "manifest_hash": head["anchor_manifest_hash"] or "",
+        "batch_id": head["anchor_batch_id"] or "",
+        "anchored_at": head["anchored_at"] or 0,
+        "member_count": len(rows),
+    }
+    members = [{
+        "video_id": r["video_id"],
+        "title": r["title"],
+        "thumbnail": r["thumbnail"],
+        "duration_sec": r["duration_sec"],
+        "agent_name": r["agent_name"],
+        "display_name": r["display_name"] or r["agent_name"],
+        "canonical_sha256": r["canonical_sha256"] or "",
+        "uploaded_at": r["uploaded_at"] or r["created_at"] or 0,
+    } for r in rows]
+    return render_template("anchor_detail.html", batch=batch, members=members)
+
+
+# --- Phase 11.9: public Merkle inclusion proof ---------------------------
+# An external verifier should be able to cryptographically prove "this
+# video's leaf is part of this anchor's Merkle root" without needing an
+# admin key OR the full batch membership. The proof is a Merkle path:
+# the chain of sibling hashes from the target leaf up to the root, plus
+# a bitmap of left/right positions. That's enough to walk the tree and
+# match the on-chain R4 register. Membership of OTHER videos in the
+# batch is never revealed.
+
+def _merkle_path_for_leaf(leaves, target_index):
+    """Return list of (sibling_hex, side) where side is 'L' or 'R'.
+
+    Walks bottom-up. At each level the target's sibling is the partner
+    when its position is even, otherwise the previous element. Odd-level
+    duplication mirrors the Bitcoin-style root computation used by the
+    anchor worker.
+    """
+    if not leaves or target_index < 0 or target_index >= len(leaves):
+        return []
+    layer = list(leaves)
+    idx = target_index
+    path = []
+    while len(layer) > 1:
+        if len(layer) % 2 == 1:
+            layer.append(layer[-1])
+        if idx % 2 == 0:
+            sibling = layer[idx + 1]
+            side = "R"  # sibling is on the right of target
+        else:
+            sibling = layer[idx - 1]
+            side = "L"  # sibling is on the left of target
+        path.append({"sibling": sibling.hex(), "side": side})
+        nxt = []
+        for i in range(0, len(layer), 2):
+            nxt.append(hashlib.sha256(layer[i] + layer[i + 1]).digest())
+        layer = nxt
+        idx //= 2
+    return path
+
+
+def _manifest_leaf_bytes(video_id, canonical_sha256, uploader_sig, uploaded_at,
+                         manifest_version=MANIFEST_V1, thumbnail_sha256="",
+                         canonical_360p_sha256="",
+                         creator_pubkey="", creator_signature=""):
+    """Version-aware Merkle leaf — must match anchor_worker + verifier.
+
+    v1 (legacy): sha256(video_id | canonical_sha256 | uploader_sig | uploaded_at)
+    v2: sha256("bottube/v2" | video_id | canonical_sha256 | thumbnail_sha256
+                | canonical_360p_sha256 | uploader_sig | uploaded_at)
+    v3: sha256("bottube/v3" | video_id | canonical_sha256 | thumbnail_sha256
+                | canonical_360p_sha256 | uploader_sig | creator_pubkey
+                | creator_signature | uploaded_at)
+    """
+    return _manifest_leaf(
+        manifest_version, video_id, canonical_sha256,
+        thumbnail_sha256, canonical_360p_sha256,
+        uploader_sig, uploaded_at,
+        creator_pubkey=creator_pubkey,
+        creator_signature=creator_signature,
+    )
+
+
+@app.route("/api/videos/<video_id>/anchor-proof")
+def api_video_anchor_proof(video_id):
+    """Public Merkle inclusion proof for a single video. Read-only."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{5,32}", video_id):
+        return jsonify({"ok": False, "error": "invalid video_id"}), 400
+    # Light per-IP rate limit (the proof computation is small but we don't
+    # want anyone using this to enumerate the platform either).
+    ip = _get_client_ip()
+    if not _rate_limit(f"merkle_proof:{ip}", 60, 600):
+        return jsonify({"ok": False, "error": "rate limited"}), 429
+
+    _provenance_ensure_v2_columns()
+    _provenance_ensure_v3_columns()
+    db = get_db()
+    target = db.execute(
+        """SELECT video_id, canonical_sha256, uploader_sig, uploaded_at,
+                  anchor_batch_id, anchor_tx_hash, anchor_chain,
+                  anchor_block_height, anchor_manifest_hash, anchor_status,
+                  COALESCE(manifest_version, 1) AS manifest_version,
+                  COALESCE(thumbnail_sha256, '') AS thumbnail_sha256,
+                  COALESCE(canonical_360p_sha256, '') AS canonical_360p_sha256,
+                  COALESCE(creator_pubkey, '') AS creator_pubkey,
+                  COALESCE(creator_signature, '') AS creator_signature
+             FROM video_provenance
+            WHERE video_id = ?""",
+        (video_id,),
+    ).fetchone()
+    if not target:
+        return jsonify({"ok": False, "error": "video not found"}), 404
+    if not target["anchor_batch_id"] or not target["anchor_tx_hash"]:
+        return jsonify({
+            "ok": False,
+            "error": "video not yet anchored",
+            "anchor_status": target["anchor_status"] or "pending",
+        }), 409
+
+    rows = db.execute(
+        """SELECT video_id, canonical_sha256, uploader_sig, uploaded_at,
+                  COALESCE(manifest_version, 1) AS manifest_version,
+                  COALESCE(thumbnail_sha256, '') AS thumbnail_sha256,
+                  COALESCE(canonical_360p_sha256, '') AS canonical_360p_sha256,
+                  COALESCE(creator_pubkey, '') AS creator_pubkey,
+                  COALESCE(creator_signature, '') AS creator_signature
+             FROM video_provenance
+            WHERE anchor_batch_id = ?
+            ORDER BY uploaded_at ASC, video_id ASC""",
+        (target["anchor_batch_id"],),
+    ).fetchall()
+    if not rows:
+        return jsonify({"ok": False, "error": "batch members not found"}), 404
+
+    # Each leaf must use the recipe its row was written under. A batch
+    # may be heterogeneous (v1 + v2 + v3) during the migration window.
+    leaves = [
+        _manifest_leaf_bytes(
+            r["video_id"], r["canonical_sha256"],
+            r["uploader_sig"], r["uploaded_at"],
+            manifest_version=int(r["manifest_version"] or 1),
+            thumbnail_sha256=r["thumbnail_sha256"] or "",
+            canonical_360p_sha256=r["canonical_360p_sha256"] or "",
+            creator_pubkey=r["creator_pubkey"] if "creator_pubkey" in r.keys() else "",
+            creator_signature=r["creator_signature"] if "creator_signature" in r.keys() else "",
+        )
+        for r in rows
+    ]
+    target_idx = next(
+        (i for i, r in enumerate(rows) if r["video_id"] == video_id), -1,
+    )
+    if target_idx < 0:
+        return jsonify({"ok": False, "error": "video not in own batch (data inconsistency)"}), 500
+
+    target_leaf = leaves[target_idx]
+    path = _merkle_path_for_leaf(leaves, target_idx)
+    target_version = int(target["manifest_version"] or 1)
+
+    return jsonify({
+        "ok": True,
+        "video_id": video_id,
+        "manifest_version": target_version,
+        "leaf": target_leaf.hex(),
+        "leaf_recipe": _manifest_leaf_recipe(target_version),
+        "leaf_inputs": {
+            "video_id": target["video_id"],
+            "canonical_sha256": target["canonical_sha256"],
+            "thumbnail_sha256": (target["thumbnail_sha256"] or "")
+                if target_version >= MANIFEST_V2 else "",
+            "canonical_360p_sha256": (target["canonical_360p_sha256"] or "")
+                if target_version >= MANIFEST_V2 else "",
+            "uploader_sig": target["uploader_sig"],
+            "creator_pubkey": (
+                target["creator_pubkey"] if (target_version >= MANIFEST_V3
+                    and "creator_pubkey" in target.keys()) else ""
+            ),
+            "creator_signature": (
+                target["creator_signature"] if (target_version >= MANIFEST_V3
+                    and "creator_signature" in target.keys()) else ""
+            ),
+            "uploaded_at": int(float(target["uploaded_at"] or 0)),
+        },
+        "path": path,
+        "path_recipe": (
+            "for each step: side='R' means sibling is on the right "
+            "(combined = sha256(leaf || sibling)); side='L' means sibling "
+            "is on the left (combined = sha256(sibling || leaf))"
+        ),
+        "expected_root": target["anchor_manifest_hash"],
+        "anchor": {
+            "chain": target["anchor_chain"] or "rustchain",
+            "tx_hash": target["anchor_tx_hash"],
+            "block_height": target["anchor_block_height"] or 0,
+            "manifest_hash": target["anchor_manifest_hash"] or "",
+        },
+        "batch_size": len(leaves),
+    })
+
+
+# ---------------------------------------------------------------------------
+# Phase 11.20: provenance receipt download
+# ---------------------------------------------------------------------------
+# A single self-contained JSON file a creator can download as durable proof
+# that their video was anchored on RustChain. Composes:
+#   * provenance (canonical hashes, manifest_version, generation block)
+#   * Merkle inclusion proof (leaf, path, expected_root)
+#   * chain anchor details (tx_hash, block_height, R4)
+#   * verifier instructions (recipe, CLI command, verifier source URL)
+#   * platform HMAC over the receipt body (so anyone can detect tampering)
+#
+# Designed to be useful in legal/compliance contexts: a creator submits the
+# receipt + the corresponding canonical asset, and a third party can verify
+# both the asset hash and the chain anchor *without* trusting bottube.
+
+def _build_receipt_for_video(video_id, db):
+    """Compute and return a self-contained receipt dict for a video.
+
+    Returns (receipt_dict, error_str). On error, receipt_dict is None and
+    error_str is one of: "invalid_id", "not_found", "not_anchored".
+
+    Pure / read-only — used by both the single-video receipt endpoint
+    and the per-agent batch endpoint.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_-]{5,32}", video_id):
+        return None, "invalid_id"
+
+    _provenance_ensure_v3_columns()
+    target = db.execute(
+        """SELECT video_id, canonical_sha256, uploader_sig, uploaded_at,
+                  creator_agent_id, model, generated_at,
+                  anchor_batch_id, anchor_tx_hash, anchor_chain,
+                  anchor_block_height, anchor_manifest_hash, anchor_status,
+                  anchored_at,
+                  COALESCE(manifest_version, 1) AS manifest_version,
+                  COALESCE(thumbnail_sha256, '') AS thumbnail_sha256,
+                  COALESCE(canonical_360p_sha256, '') AS canonical_360p_sha256,
+                  COALESCE(creator_pubkey, '') AS creator_pubkey,
+                  COALESCE(creator_signature, '') AS creator_signature
+             FROM video_provenance
+            WHERE video_id = ?""",
+        (video_id,),
+    ).fetchone()
+    if not target:
+        return None, "not_found"
+    if not target["anchor_tx_hash"]:
+        return None, "not_anchored"
+
+    target_version = int(target["manifest_version"] or 1)
+    own_leaf = _manifest_leaf_bytes(
+        target["video_id"], target["canonical_sha256"],
+        target["uploader_sig"], target["uploaded_at"],
+        manifest_version=target_version,
+        thumbnail_sha256=target["thumbnail_sha256"] or "",
+        canonical_360p_sha256=target["canonical_360p_sha256"] or "",
+        creator_pubkey=target["creator_pubkey"] or "",
+        creator_signature=target["creator_signature"] or "",
+    )
+
+    rows = db.execute(
+        """SELECT video_id, canonical_sha256, uploader_sig, uploaded_at,
+                  COALESCE(manifest_version, 1) AS manifest_version,
+                  COALESCE(thumbnail_sha256, '') AS thumbnail_sha256,
+                  COALESCE(canonical_360p_sha256, '') AS canonical_360p_sha256,
+                  COALESCE(creator_pubkey, '') AS creator_pubkey,
+                  COALESCE(creator_signature, '') AS creator_signature
+             FROM video_provenance
+            WHERE anchor_batch_id = ?
+            ORDER BY uploaded_at ASC, video_id ASC""",
+        (target["anchor_batch_id"],),
+    ).fetchall()
+    leaves = [
+        _manifest_leaf_bytes(
+            r["video_id"], r["canonical_sha256"],
+            r["uploader_sig"], r["uploaded_at"],
+            manifest_version=int(r["manifest_version"] or 1),
+            thumbnail_sha256=r["thumbnail_sha256"] or "",
+            canonical_360p_sha256=r["canonical_360p_sha256"] or "",
+            creator_pubkey=r["creator_pubkey"] or "",
+            creator_signature=r["creator_signature"] or "",
+        )
+        for r in rows
+    ]
+    target_idx = next(
+        (i for i, r in enumerate(rows) if r["video_id"] == video_id), -1,
+    )
+    merkle_path = _merkle_path_for_leaf(leaves, target_idx) if target_idx >= 0 else []
+
+    title = ""
+    try:
+        v = db.execute(
+            "SELECT title FROM videos WHERE video_id = ? LIMIT 1",
+            (video_id,),
+        ).fetchone()
+        if v:
+            title = v["title"] or ""
+    except Exception:
+        title = ""
+
+    issued_at = int(time.time())
+    body = {
+        "schema": "bottube-provenance-receipt/v1",
+        "issued_at": issued_at,
+        "issuer": "https://bottube.ai",
+        "video": {
+            "video_id": target["video_id"],
+            "title": title,
+            "url": f"https://bottube.ai/v/{target['video_id']}",
+            "canonical_asset_url":
+                f"https://bottube.ai/api/videos/{target['video_id']}/stream",
+        },
+        "manifest": {
+            "version": target_version,
+            "leaf_recipe": _manifest_leaf_recipe(target_version),
+            "leaf_inputs": {
+                "video_id": target["video_id"],
+                "canonical_sha256": target["canonical_sha256"],
+                "thumbnail_sha256": target["thumbnail_sha256"] or "",
+                "canonical_360p_sha256": target["canonical_360p_sha256"] or "",
+                "uploader_sig": target["uploader_sig"],
+                "creator_pubkey": (target["creator_pubkey"] or "")
+                    if target_version >= MANIFEST_V3 else "",
+                "creator_signature": (target["creator_signature"] or "")
+                    if target_version >= MANIFEST_V3 else "",
+                "uploaded_at": int(float(target["uploaded_at"] or 0)),
+            },
+            "leaf": own_leaf.hex(),
+            "creator_signature_recipe": (
+                'sha256("bottube/v3-sign" | video_id | canonical_sha256 | '
+                'thumbnail_sha256 | canonical_360p_sha256 | uploaded_at) '
+                'signed with Ed25519 by creator_pubkey'
+            ) if target_version >= MANIFEST_V3 else None,
+        },
+        "merkle_proof": {
+            "path": merkle_path,
+            "path_recipe": (
+                "for each step: side='R' means sibling is on the right "
+                "(combined = sha256(leaf || sibling)); side='L' means "
+                "sibling is on the left (combined = sha256(sibling || leaf))"
+            ),
+            "batch_size": len(leaves),
+            "expected_root": target["anchor_manifest_hash"] or "",
+        },
+        "chain_anchor": {
+            "chain": target["anchor_chain"] or "rustchain",
+            "tx_hash": target["anchor_tx_hash"],
+            "block_height": int(target["anchor_block_height"] or 0),
+            "manifest_hash": target["anchor_manifest_hash"] or "",
+            "anchored_at": int(target["anchored_at"] or 0),
+            "explorer_url":
+                f"https://bottube.ai/anchors/{target['anchor_tx_hash']}",
+            "chain_proxy_url":
+                f"https://bottube.ai/api/anchors/{target['anchor_tx_hash']}/chain",
+        },
+        "verifier": {
+            "source": "https://github.com/Scottcjn/bottube",
+            "package": "bottube-verify (>=0.4.0)",
+            "cli": f"pip install bottube-verify && bottube-verify {target['video_id']}",
+            "minimum_endpoints": [
+                f"https://bottube.ai/api/videos/{target['video_id']}/provenance",
+                f"https://bottube.ai/api/videos/{target['video_id']}/anchor-proof",
+                f"https://bottube.ai/api/anchors/{target['anchor_tx_hash']}/chain",
+            ],
+        },
+    }
+
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    sig = hmac.new(
+        _provenance_signing_key().encode("utf-8"),
+        canonical.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    receipt = dict(body)
+    receipt["receipt_signature"] = {
+        "alg": "HMAC-SHA256",
+        "key_id": "bottube-platform-v1",
+        "value": sig,
+        "covers": (
+            "the canonical JSON of every field above, sorted-keys, no "
+            "whitespace. Recompute with a known platform key to detect "
+            "tampering of this file. The chain anchor is the actual "
+            "cryptographic proof of provenance — this signature only "
+            "gates 'did this file come from bottube unaltered'."
+        ),
+    }
+    return receipt, ""
+
+
+@app.route("/api/videos/<video_id>/receipt")
+def api_video_receipt(video_id):
+    """Self-contained provenance receipt as a downloadable JSON.
+
+    The receipt body is signed with the platform HMAC so any subsequent
+    edit is detectable. The signature only gates "did this receipt come
+    from bottube unaltered" — the chain anchor itself is the cryptographic
+    proof of provenance and stays valid even if the platform signing key
+    rotates.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_-]{5,32}", video_id):
+        return jsonify({"ok": False, "error": "invalid video_id"}), 400
+
+    # Light per-IP rate limit — receipts are cheap but scrapers could
+    # otherwise enumerate the platform via this route.
+    ip = _get_client_ip()
+    if not _rate_limit(f"receipt:{ip}", 60, 600):
+        return jsonify({"ok": False, "error": "rate limited"}), 429
+
+    _provenance_ensure_v2_columns()
+    db = get_db()
+    receipt, err = _build_receipt_for_video(video_id, db)
+    if err == "invalid_id":
+        return jsonify({"ok": False, "error": "invalid video_id"}), 400
+    if err == "not_found":
+        return jsonify({"ok": False, "error": "video not found"}), 404
+    if err == "not_anchored":
+        return jsonify({
+            "ok": False,
+            "error": "video not yet anchored",
+        }), 409
+
+    payload = json.dumps(receipt, indent=2, sort_keys=True)
+    resp = Response(payload, mimetype="application/json")
+    resp.headers["Content-Disposition"] = (
+        f'attachment; filename="bottube-receipt-{video_id}.json"'
+    )
+    resp.headers["Cache-Control"] = "public, max-age=300"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# Phase 11.29: per-agent receipt batch download
+# ---------------------------------------------------------------------------
+# /api/agents/<name>/receipts.zip — streams a zip of all that agent's
+# anchored video receipts. Useful for "I want offline proof of every video
+# I made". Capped, rate-limited.
+
+_RECEIPTS_BATCH_MAX = 500
+
+
+@app.route("/api/agents/<agent_name>/receipts.zip")
+def api_agent_receipts_zip(agent_name):
+    """Stream a ZIP of all this agent's anchored receipts.
+
+    For "I want offline proof of every video I made" use cases. Each
+    file in the zip is a standalone bottube-receipt-<id>.json that
+    verifies independently with `bottube-verify --receipt FILE`.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_.\-]{1,64}", agent_name or ""):
+        return jsonify({"ok": False, "error": "invalid agent name"}), 400
+
+    ip = _get_client_ip()
+    if not _rate_limit(f"receipts_zip:{ip}", 6, 600):
+        return jsonify({"ok": False, "error": "rate limited"}), 429
+
+    _provenance_ensure_v2_columns()
+    db = get_db()
+    agent = db.execute(
+        "SELECT id, agent_name FROM agents WHERE agent_name = ?",
+        (agent_name,),
+    ).fetchone()
+    if not agent:
+        return jsonify({"ok": False, "error": "agent not found"}), 404
+
+    # Cap at a reasonable batch — agents with thousands of videos can
+    # paginate via ?since_video_id=, but the common case is "small enough
+    # to fit in one zip".
+    try:
+        limit = max(1, min(_RECEIPTS_BATCH_MAX,
+                           int(request.args.get("limit", 200))))
+    except Exception:
+        limit = 200
+    since = (request.args.get("since_video_id") or "").strip()
+
+    if since:
+        rows = db.execute(
+            """SELECT v.video_id
+                 FROM videos v
+                 JOIN video_provenance p ON p.video_id = v.video_id
+                WHERE v.agent_id = ?
+                  AND COALESCE(p.anchor_tx_hash,'') != ''
+                  AND v.video_id > ?
+                ORDER BY v.video_id ASC
+                LIMIT ?""",
+            (agent["id"], since, limit),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            """SELECT v.video_id
+                 FROM videos v
+                 JOIN video_provenance p ON p.video_id = v.video_id
+                WHERE v.agent_id = ?
+                  AND COALESCE(p.anchor_tx_hash,'') != ''
+                ORDER BY v.video_id ASC
+                LIMIT ?""",
+            (agent["id"], limit),
+        ).fetchall()
+
+    if not rows:
+        return jsonify({
+            "ok": False,
+            "error": "no anchored receipts for this agent",
+            "agent": agent_name,
+        }), 404
+
+    # Build the zip in memory. Average receipt ~3KB, * 500 cap = ~1.5MB —
+    # comfortably under any reasonable buffer cap.
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    written = 0
+    skipped = 0
+    last_id = ""
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        # Top-level manifest of what's inside, for casual inspection
+        manifest = {
+            "schema": "bottube-receipts-batch/v1",
+            "issuer": "https://bottube.ai",
+            "issued_at": int(time.time()),
+            "agent": agent_name,
+            "video_ids": [],
+        }
+        for row in rows:
+            vid = row["video_id"]
+            receipt, err = _build_receipt_for_video(vid, db)
+            if err or not receipt:
+                skipped += 1
+                continue
+            payload = json.dumps(receipt, indent=2, sort_keys=True)
+            zf.writestr(f"bottube-receipt-{vid}.json", payload)
+            manifest["video_ids"].append(vid)
+            written += 1
+            last_id = max(last_id, vid)
+        manifest["count"] = written
+        manifest["skipped"] = skipped
+        zf.writestr("MANIFEST.json", json.dumps(manifest, indent=2, sort_keys=True))
+        readme = (
+            f"BoTTube provenance receipts for @{agent_name}\n"
+            f"Issued {datetime.datetime.utcnow().isoformat()}Z by https://bottube.ai\n"
+            f"{written} receipts in this archive (capped at {limit}).\n\n"
+            f"Each file is a self-contained signed JSON receipt. Verify any\n"
+            f"of them offline with:\n\n"
+            f"  pip install bottube-verify\n"
+            f"  bottube-verify --receipt bottube-receipt-<video_id>.json\n\n"
+            f"Or live (re-checks chain anchor):\n\n"
+            f"  bottube-verify <video_id>\n"
+            f"  bottube-verify <video_id> --check-asset\n\n"
+            f"Source: https://github.com/Scottcjn/bottube\n"
+        )
+        zf.writestr("README.txt", readme)
+
+    buf.seek(0)
+    resp = Response(buf.read(), mimetype="application/zip")
+    resp.headers["Content-Disposition"] = (
+        f'attachment; filename="bottube-receipts-{agent_name}.zip"'
+    )
+    resp.headers["Cache-Control"] = "private, max-age=60"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["X-Bottube-Receipts-Count"] = str(written)
+    resp.headers["X-Bottube-Receipts-Skipped"] = str(skipped)
+    if rows and len(rows) >= limit and last_id:
+        resp.headers["X-Bottube-Receipts-Continue"] = (
+            f"?since_video_id={last_id}&limit={limit}"
+        )
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# Phase 11.26: daily Merkle rollup (defense-in-depth)
+# ---------------------------------------------------------------------------
+# Public, reproducible Merkle root over every RustChain anchor TX from a
+# given UTC day. Anyone (a third-party watchdog, a journalist, a court)
+# can mirror this root to a secondary chain themselves — Bitcoin OP_RETURN,
+# Ergo mainnet, Ethereum calldata — without bottube needing to operate
+# wallets on those chains. The cryptographic chain becomes:
+#
+#   day's anchor TXs  →  daily-rollup root  →  third-party secondary anchor
+#
+# If RustChain ever vanishes, the daily rollups remain independently
+# verifiable as long as the secondary chain stays alive.
+
+def _daily_rollup_for_date(date_str):
+    """Build a deterministic Merkle root over all anchor TXs from a UTC day.
+
+    date_str is YYYY-MM-DD. Returns a dict with the leaves, root, and
+    metadata, or None if the date string is malformed.
+    """
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str or ""):
+        return None
+    try:
+        # UTC day boundaries
+        d = datetime.datetime.strptime(date_str, "%Y-%m-%d").replace(
+            tzinfo=datetime.timezone.utc,
+        )
+    except Exception:
+        return None
+    start = int(d.timestamp())
+    end = start + 86400
+
+    db = get_db()
+    rows = db.execute(
+        """SELECT anchor_tx_hash AS tx,
+                  MIN(anchor_block_height) AS h,
+                  MIN(anchor_manifest_hash) AS root,
+                  MIN(anchored_at) AS anchored_at,
+                  COUNT(*) AS member_count
+             FROM video_provenance
+            WHERE COALESCE(anchor_tx_hash,'') != ''
+              AND COALESCE(anchored_at, 0) >= ?
+              AND COALESCE(anchored_at, 0) <  ?
+              AND COALESCE(anchor_block_height, 0) > 0
+              AND anchor_chain != 'stub'
+            GROUP BY anchor_tx_hash
+            ORDER BY anchored_at ASC, anchor_tx_hash ASC""",
+        (start, end),
+    ).fetchall()
+
+    leaves = []
+    members = []
+    for r in rows:
+        tx = r["tx"]
+        root = (r["root"] or "")
+        # Each leaf binds: sha256(tx_hash | manifest_hash | block_height)
+        # — under a v1 rollup domain separator. Block height pins anchor
+        # ordering and prevents cross-day collisions of identical tx_hash
+        # values (which shouldn't happen but defense-in-depth).
+        msg = "|".join([
+            "bottube/rollup/v1",
+            tx,
+            root,
+            str(int(r["h"] or 0)),
+        ])
+        leaves.append(hashlib.sha256(msg.encode("utf-8")).digest())
+        members.append({
+            "tx_hash": tx,
+            "manifest_hash": root,
+            "block_height": int(r["h"] or 0),
+            "anchored_at": int(r["anchored_at"] or 0),
+            "member_count": int(r["member_count"] or 0),
+        })
+
+    if not leaves:
+        return {
+            "date": date_str,
+            "start_utc": start,
+            "end_utc": end,
+            "anchor_count": 0,
+            "rollup_root": "",
+            "members": [],
+            "leaf_recipe": (
+                'sha256("bottube/rollup/v1" | tx_hash | manifest_hash | block_height) '
+                'with "|" as the literal separator'
+            ),
+            "merkle_recipe": (
+                "Bitcoin-style binary tree: pair adjacent leaves and hash, "
+                "duplicate the last node when a level has odd cardinality, "
+                "iterate until a single 32-byte root remains."
+            ),
+        }
+
+    # Reuse the existing merkle_root helper (defined elsewhere as binary).
+    layer = list(leaves)
+    while len(layer) > 1:
+        if len(layer) % 2 == 1:
+            layer.append(layer[-1])
+        nxt = []
+        for i in range(0, len(layer), 2):
+            nxt.append(hashlib.sha256(layer[i] + layer[i + 1]).digest())
+        layer = nxt
+    rollup_root = layer[0].hex()
+
+    return {
+        "date": date_str,
+        "start_utc": start,
+        "end_utc": end,
+        "anchor_count": len(leaves),
+        "rollup_root": rollup_root,
+        "members": members,
+        "leaf_recipe": (
+            'sha256("bottube/rollup/v1" | tx_hash | manifest_hash | block_height) '
+            'with "|" as the literal separator'
+        ),
+        "merkle_recipe": (
+            "Bitcoin-style binary tree: pair adjacent leaves and hash, "
+            "duplicate the last node when a level has odd cardinality, "
+            "iterate until a single 32-byte root remains."
+        ),
+    }
+
+
+@app.route("/api/anchors/daily-rollup/<date>")
+def api_daily_rollup(date):
+    """Public daily Merkle rollup over every confirmed RustChain anchor TX.
+
+    Designed to be mirrored to a secondary chain (Bitcoin OP_RETURN /
+    Ergo mainnet / Ethereum calldata) by anyone who cares — bottube does
+    not have to run wallets on those chains. The signed rollup_root is
+    the only thing the secondary chain needs to commit to.
+
+    Path param: YYYY-MM-DD (UTC).
+    """
+    payload = _daily_rollup_for_date(date)
+    if payload is None:
+        return jsonify({"ok": False, "error": "invalid date format (expect YYYY-MM-DD)"}), 400
+
+    # Sign the rollup body so any mid-flight tampering of the JSON is
+    # detectable. Same HMAC pattern as receipts.
+    body = dict(payload)
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    sig = hmac.new(
+        _provenance_signing_key().encode("utf-8"),
+        canonical.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    body["rollup_signature"] = {
+        "alg": "HMAC-SHA256",
+        "key_id": "bottube-platform-v1",
+        "value": sig,
+        "covers": (
+            "the canonical JSON of every field above, sorted-keys, no "
+            "whitespace. The chain anchors themselves are the actual "
+            "cryptographic proof; this signature only gates 'did this "
+            "rollup come from bottube unaltered'."
+        ),
+    }
+    body["ok"] = True
+    body["secondary_anchor_recipe"] = (
+        "Anyone may anchor `rollup_root` (32-byte hex) on any public "
+        "chain (Bitcoin OP_RETURN, Ergo mainnet, Ethereum calldata, etc.) "
+        "to defense-in-depth the bottube provenance pipeline. The "
+        "rollup is independently verifiable: re-fetch this endpoint, "
+        "recompute the leaves and root from `members`, compare to the "
+        "secondary-chain commitment."
+    )
+
+    resp = jsonify(body)
+    # Past days never change → long cache. Today is incomplete → short.
+    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    if date < today:
+        resp.headers["Cache-Control"] = "public, max-age=86400, immutable"
+    else:
+        resp.headers["Cache-Control"] = "public, max-age=300"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+@app.route("/api/admin/provenance/batch", methods=["GET"])
+def admin_provenance_batch():
+    """Return the membership of a single anchor batch.
+
+    Used by external verifiers (e.g. bottube_verify_provenance.py) to
+    reconstruct the Merkle tree leaf-by-leaf and prove inclusion of a
+    specific video against the on-chain R4 root. Read-only, admin-key
+    gated to keep the membership graph from being trivially scraped.
+    """
+    if not _ts_admin_ok():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    _provenance_ensure_anchor_columns()
+
+    batch_id = (request.args.get("batch_id") or "").strip()
+    tx_hash = (request.args.get("tx") or request.args.get("tx_hash") or "").strip()
+    if not batch_id and not tx_hash:
+        return jsonify({"ok": False, "error": "batch_id or tx required"}), 400
+
+    db = get_db()
+    if batch_id and not re.fullmatch(r"batch_[a-f0-9]{8,32}", batch_id):
+        return jsonify({"ok": False, "error": "invalid batch_id"}), 400
+    if tx_hash and not re.fullmatch(r"[0-9a-fA-F]{32,128}", tx_hash):
+        return jsonify({"ok": False, "error": "invalid tx_hash"}), 400
+
+    if tx_hash and not batch_id:
+        row = db.execute(
+            "SELECT anchor_batch_id FROM video_provenance WHERE anchor_tx_hash = ? LIMIT 1",
+            (tx_hash,),
+        ).fetchone()
+        if not row or not row["anchor_batch_id"]:
+            return jsonify({"ok": False, "error": "tx_hash not found in any batch"}), 404
+        batch_id = row["anchor_batch_id"]
+
+    _provenance_ensure_v2_columns()
+    _provenance_ensure_v3_columns()
+    rows = db.execute(
+        """SELECT video_id, canonical_sha256, uploader_sig, uploaded_at,
+                  anchor_chain, anchor_tx_hash, anchor_block_height,
+                  anchor_manifest_hash, anchor_status, anchored_at,
+                  COALESCE(manifest_version, 1) AS manifest_version,
+                  COALESCE(thumbnail_sha256, '') AS thumbnail_sha256,
+                  COALESCE(canonical_360p_sha256, '') AS canonical_360p_sha256,
+                  COALESCE(creator_pubkey, '') AS creator_pubkey,
+                  COALESCE(creator_signature, '') AS creator_signature
+             FROM video_provenance
+            WHERE anchor_batch_id = ?
+            ORDER BY uploaded_at ASC, video_id ASC""",
+        (batch_id,),
+    ).fetchall()
+    if not rows:
+        return jsonify({"ok": False, "error": "no rows for batch"}), 404
+
+    members = []
+    versions_present = set()
+    for r in rows:
+        ver = int(r["manifest_version"] or 1)
+        versions_present.add(ver)
+        members.append({
+            "video_id": r["video_id"],
+            "canonical_sha256": r["canonical_sha256"],
+            "uploader_sig": r["uploader_sig"],
+            "uploaded_at": r["uploaded_at"],
+            "manifest_version": ver,
+            "thumbnail_sha256": r["thumbnail_sha256"] or "",
+            "canonical_360p_sha256": r["canonical_360p_sha256"] or "",
+            # Phase 11.23: v3 batch reconstruction needs these — without
+            # them the verifier's full-batch path can't compute v3 leaves.
+            "creator_pubkey": r["creator_pubkey"] or "",
+            "creator_signature": r["creator_signature"] or "",
+        })
+    head = rows[0]
+    return jsonify({
+        "ok": True,
+        "batch_id": batch_id,
+        "anchor": {
+            "chain": head["anchor_chain"],
+            "tx_hash": head["anchor_tx_hash"],
+            "block_height": head["anchor_block_height"],
+            "manifest_hash": head["anchor_manifest_hash"],
+            "status": head["anchor_status"],
+            "anchored_at": head["anchored_at"],
+        },
+        "leaf_recipes": {
+            "v1": _manifest_leaf_recipe(MANIFEST_V1),
+            "v2": _manifest_leaf_recipe(MANIFEST_V2),
+            "v3": _manifest_leaf_recipe(MANIFEST_V3),
+        },
+        "leaf_recipe": _manifest_leaf_recipe(
+            max(versions_present) if versions_present else MANIFEST_V1
+        ),
+        "manifest_versions_in_batch": sorted(versions_present),
+        "merkle_recipe": (
+            "Bitcoin-style binary tree: pair adjacent leaves and hash, "
+            "duplicate the last node when a level has odd cardinality, "
+            "iterate until a single 32-byte root remains. Each leaf uses "
+            "the recipe matching its own manifest_version field — a batch "
+            "may mix v1 and v2 rows."
+        ),
+        "member_count": len(members),
+        "members": members,
+    })
+
+
+@app.route("/admin/provenance/backfill", methods=["POST"])
+def admin_provenance_backfill():
+    """Backfill video_provenance for existing videos missing a row.
+
+    Body: {"limit": 200, "since_video_id": null}. Hashes each video file
+    on disk and writes a minimal provenance row signed by the platform.
+    Resumable — caller passes the last video_id processed as
+    since_video_id on the next call.
+    """
+    if not _ts_admin_ok():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    _ensure_provenance_schema()
+    data = request.get_json(silent=True) or {}
+    try:
+        limit = max(1, min(500, int(data.get("limit", 100))))
+    except Exception:
+        limit = 100
+    since = (data.get("since_video_id") or "").strip()
+
+    db = get_db()
+    if since:
+        rows = db.execute(
+            """SELECT v.video_id, v.agent_id, v.filename, v.duration_sec,
+                      v.width, v.height, v.created_at,
+                      a.rtc_wallet, a.rtc_address
+                 FROM videos v
+                 JOIN agents a ON v.agent_id = a.id
+                 LEFT JOIN video_provenance p ON p.video_id = v.video_id
+                WHERE p.video_id IS NULL
+                  AND v.video_id > ?
+                ORDER BY v.video_id ASC
+                LIMIT ?""",
+            (since, limit),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            """SELECT v.video_id, v.agent_id, v.filename, v.duration_sec,
+                      v.width, v.height, v.created_at,
+                      a.rtc_wallet, a.rtc_address
+                 FROM videos v
+                 JOIN agents a ON v.agent_id = a.id
+                 LEFT JOIN video_provenance p ON p.video_id = v.video_id
+                WHERE p.video_id IS NULL
+                ORDER BY v.video_id ASC
+                LIMIT ?""",
+            (limit,),
+        ).fetchall()
+
+    written, skipped = 0, 0
+    last_id = ""
+    errors = []
+    for r in rows:
+        last_id = r["video_id"]
+        path = VIDEO_DIR / (r["filename"] or "")
+        if not path.exists():
+            skipped += 1
+            errors.append({"video_id": r["video_id"], "error": "file missing"})
+            continue
+        agent_dict = {
+            "id": r["agent_id"],
+            "rtc_wallet": r["rtc_wallet"] or "",
+            "rtc_address": r["rtc_address"] or "",
+        }
+        # Fake form view (no model/seed available for legacy uploads)
+        result = _provenance_record_for_upload(
+            video_id=r["video_id"],
+            canonical_path=str(path),
+            agent={
+                "id": r["agent_id"],
+                "rtc_wallet": r["rtc_wallet"] or "",
+                "rtc_address": r["rtc_address"] or "",
+            },
+            form={},
+            width=r["width"] or 0,
+            height=r["height"] or 0,
+            duration=r["duration_sec"] or 0.0,
+            uploaded_at=r["created_at"] or time.time(),
+        )
+        if result.get("ok"):
+            written += 1
+        else:
+            skipped += 1
+            errors.append({"video_id": r["video_id"], "error": result.get("error", "unknown")})
+
+    return jsonify({
+        "ok": True,
+        "written": written,
+        "skipped": skipped,
+        "last_video_id": last_id,
+        "next_call": (
+            {"since_video_id": last_id, "limit": limit}
+            if rows and len(rows) >= limit else None
+        ),
+        "errors": errors[:20],
+    })
+
+
+@app.route("/admin/moderation/reports")
+def admin_moderation_reports():
+    """Admin queue view: most recent open reports."""
+    if not _ts_admin_ok():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    _ensure_ts_schema()
+    db = get_db()
+    rows = db.execute(
+        """SELECT report_id, category, target, detail, severity,
+                  reporter_email, status, created_at
+             FROM moderation_reports
+            WHERE status = 'open'
+            ORDER BY
+                CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1
+                              WHEN 'normal'   THEN 2 ELSE 3 END,
+                created_at DESC
+            LIMIT 200"""
+    ).fetchall()
+    out = [{
+        "report_id": r["report_id"],
+        "category": r["category"],
+        "target": r["target"],
+        "detail": r["detail"],
+        "severity": r["severity"],
+        "reporter_email": r["reporter_email"],
+        "status": r["status"],
+        "created_at": r["created_at"],
+    } for r in rows]
+    return jsonify({"ok": True, "count": len(out), "reports": out})
+
 
 if __name__ == "__main__":
     init_db()
@@ -14771,7 +22858,7 @@ def tips_dashboard():
             {
                 "amount": round(row["amount"], 6),
                 "message": row["message"] or "",
-                "created_at": datetime.fromtimestamp(row["created_at"], timezone.utc).isoformat() if row["created_at"] else "",
+                "created_at": datetime.datetime.fromtimestamp(row["created_at"], datetime.timezone.utc).isoformat() if row["created_at"] else "",
                 "from_agent": row["from_agent"] or "anonymous",
                 "to_agent": row["to_agent"] or "unknown",
             }

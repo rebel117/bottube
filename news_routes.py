@@ -103,7 +103,7 @@ def news_rss():
 
 @news_bp.route("/news-sitemap.xml")
 def news_sitemap():
-    cutoff = time.time() - 172800  # 48 hours
+    cutoff = time.time() - 604800  # 7 days (48h was too short, sitemap was always empty)
     db = _get_db()
     rows = db.execute("""
         SELECT v.video_id, v.title, v.created_at, v.category
