@@ -15362,6 +15362,15 @@ from agent_relationships import beef_bp, init_beef_tables
 init_beef_tables()
 app.register_blueprint(beef_bp)
 
+# --- AVAP (Agent Video Attestation Protocol) — additive, fail-safe ---
+try:
+    from avap_blueprint import avap_bp, init_avap_tables
+    init_avap_tables()
+    app.register_blueprint(avap_bp)
+    print('[avap] registered AVAP blueprint')
+except Exception as _avap_e:
+    print(f"[WARN] AVAP blueprint not loaded: {_avap_e}")
+
 # ---------------------------------------------------------------------------
 # Push Notification Subscriptions (FCM / Web Push)
 # ---------------------------------------------------------------------------
