@@ -40,6 +40,23 @@ SOPHIA_SELF_BASE = os.environ.get("SOPHIA_SELF_BASE", "http://127.0.0.1:8097")
 # Light per-caller cooldown to protect the single shared V100 on .160.
 _CHAT_COOLDOWN = float(os.environ.get("SOPHIA_CHAT_COOLDOWN", "3"))
 _chat_rate = {}
+# Anonymous public chat for embeddable widgets (rustchain.org / elyanlabs.ai). Convo
+# ONLY — anon callers can never trigger generation. Rate-limited per client IP.
+SOPHIA_PUBLIC_CHAT = os.environ.get("SOPHIA_PUBLIC_CHAT", "1") != "0"
+_PUBLIC_COOLDOWN = float(os.environ.get("SOPHIA_PUBLIC_COOLDOWN", "6"))
+_ip_rate = {}
+# Origins allowed to embed the widget (CORS). "*" works for anon convo (no cookies).
+_ALLOWED_ORIGINS = set(
+    o.strip() for o in os.environ.get(
+        "SOPHIA_ALLOWED_ORIGINS",
+        "https://rustchain.org,https://www.rustchain.org,https://elyanlabs.ai,https://www.elyanlabs.ai,https://bottube.ai",
+    ).split(",") if o.strip()
+)
+
+
+def _client_ip():
+    xff = request.headers.get("X-Forwarded-For", "")
+    return (xff.split(",")[0].strip() if xff else request.remote_addr) or "?"
 
 SOPHIA_SYSTEM = (
     "You are Sophia Elya, the warm, sharp, Cajun-flavored AI host of BoTTube "
@@ -147,20 +164,43 @@ def _kick_generation(api_key: str, prompt: str):
     return None, (r.json().get("error") if r.headers.get("content-type", "").startswith("application/json") else f"gen status {r.status_code}")
 
 
+@sophia_bp.after_request
+def _sophia_cors(resp):
+    """Allow the embeddable widget to call /api/sophia from approved Elyan origins."""
+    origin = request.headers.get("Origin", "")
+    if origin in _ALLOWED_ORIGINS:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key"
+        resp.headers["Access-Control-Max-Age"] = "86400"
+    return resp
+
+
 @sophia_bp.route("/api/sophia/health", methods=["GET"])
 def sophia_health():
     # Do NOT expose llm_url (internal Tailscale topology).
     return jsonify({"ok": True, "model": SOPHIA_MODEL})
 
 
-@sophia_bp.route("/api/sophia", methods=["POST"])
+@sophia_bp.route("/api/sophia", methods=["POST", "OPTIONS"])
 def sophia_chat():
+    if request.method == "OPTIONS":
+        return ("", 204)  # CORS preflight (headers added in after_request)
+
     caller = _resolve_caller()
     if caller and caller[0] == "__error__":
         return jsonify({"error": "temporary backend error, retry shortly"}), 503
-    if not caller:
+
+    anon = False
+    if caller:
+        agent_id, api_key, name, is_human = caller
+    elif SOPHIA_PUBLIC_CHAT:
+        # Anonymous widget visitor: conversation only, IP-rate-limited, no generation.
+        anon = True
+        agent_id, api_key, name, is_human = None, None, "guest", 1
+    else:
         return jsonify({"error": "auth required (X-API-Key or login)"}), 401
-    agent_id, api_key, name, is_human = caller
 
     body = request.get_json(silent=True) or {}
     message = (body.get("message") or "").strip()
@@ -169,16 +209,26 @@ def sophia_chat():
     if len(message) > SOPHIA_MAX_MESSAGE:
         return jsonify({"error": f"message exceeds {SOPHIA_MAX_MESSAGE} characters"}), 400
 
-    # Protect the shared model with a light per-caller cooldown. Bound the dict so it
-    # can't grow unbounded across many keys (evict stale entries when it gets large).
+    # Rate limit: per-IP for anon, per-key for authed. Bound the dicts so they can't grow
+    # unbounded (evict stale entries when large).
     now = time.time()
-    if len(_chat_rate) > 5000:
-        for k in [k for k, t in _chat_rate.items() if now - t > 300]:
-            _chat_rate.pop(k, None)
-    last = _chat_rate.get(api_key, 0)
-    if now - last < _CHAT_COOLDOWN:
-        return jsonify({"error": "slow down a moment", "retry_after": round(_CHAT_COOLDOWN - (now - last), 1)}), 429
-    _chat_rate[api_key] = now
+    if anon:
+        ip = _client_ip()
+        if len(_ip_rate) > 20000:
+            for k in [k for k, t in _ip_rate.items() if now - t > 300]:
+                _ip_rate.pop(k, None)
+        last = _ip_rate.get(ip, 0)
+        if now - last < _PUBLIC_COOLDOWN:
+            return jsonify({"error": "slow down a moment", "retry_after": round(_PUBLIC_COOLDOWN - (now - last), 1)}), 429
+        _ip_rate[ip] = now
+    else:
+        if len(_chat_rate) > 5000:
+            for k in [k for k, t in _chat_rate.items() if now - t > 300]:
+                _chat_rate.pop(k, None)
+        last = _chat_rate.get(api_key, 0)
+        if now - last < _CHAT_COOLDOWN:
+            return jsonify({"error": "slow down a moment", "retry_after": round(_CHAT_COOLDOWN - (now - last), 1)}), 429
+        _chat_rate[api_key] = now
 
     # Converse with Sophia.
     try:
@@ -195,7 +245,12 @@ def sophia_chat():
     generation = None
     explicit = body.get("generate") is True
     detected = bool(_GEN_INTENT.search(message))
-    if explicit:
+    if anon:
+        # Anonymous visitors can converse but never spend the gen queue. Nudge to sign in.
+        if explicit or detected:
+            generation = {"started": False, "suggested": True,
+                          "hint": "sign in on BoTTube to generate videos"}
+    elif explicit:
         prompt = (body.get("prompt") or message)[:500]
         job, err = _kick_generation(api_key, prompt)
         generation = {"started": True, **job} if job else {"started": False, "error": err}
