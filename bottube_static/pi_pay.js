@@ -13,18 +13,26 @@ function _payStatus(msg) {
   console.log("[pi-pay]", msg);
 }
 
-async function piInit() {
-  try {
-    const cfg = await (await fetch("/pi/health")).json();
-    PI_CFG.products = cfg.products || {};   // server-authoritative prices
-  } catch (e) { /* prices fetched lazily in piBuy too */ }
-  Pi.init({ version: "2.0", sandbox: _PAY_SANDBOX });
+// Singleton init — ALWAYS run before createPayment (the old code skipped Pi.init when
+// prices were already cached, causing "Pi Network SDK was not initialized").
+let _payInit = null;
+function piInit() {
+  if (!_payInit) {
+    _payInit = (async () => {
+      try {
+        const cfg = await (await fetch("/pi/health")).json();
+        PI_CFG.products = cfg.products || {};   // server-authoritative prices
+      } catch (e) { /* prices fetched lazily below too */ }
+      Pi.init({ version: "2.0", sandbox: _PAY_SANDBOX });
+    })();
+  }
+  return _payInit;
 }
 
 async function piBuy(product) {
   try {
     if (typeof Pi === "undefined") { _payStatus("Pi SDK not loaded — open in the Pi Browser."); return; }
-    if (!PI_CFG.products[product]) { await piInit(); }
+    await piInit();  // guarantee Pi.init ran (fetches prices too)
     const amount = PI_CFG.products[product];
     if (amount == null) { _payStatus("Unknown product: " + product); return; }
 
