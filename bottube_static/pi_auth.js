@@ -22,7 +22,10 @@
   }
 
   var _init;
-  function piInit() { if (!_init) { _init = Promise.resolve(Pi.init({ version: "2.0", sandbox: false })); } return _init; }
+  // sandbox:true ONLY for the desktop Pi Sandbox (sandbox.minepi.com) — enable with
+  // ?pi_sandbox=1. Real Pi Browser must use sandbox:false (the default).
+  var _SANDBOX = /[?&]pi_sandbox=1/.test(location.search) || window.PI_SANDBOX === true;
+  function piInit() { if (!_init) { _init = Promise.resolve(Pi.init({ version: "2.0", sandbox: _SANDBOX })); } return _init; }
 
   async function piSignIn() {
     if (typeof Pi === "undefined") { diag("no_pi"); console.warn("Pi SDK not loaded"); return; }
@@ -101,7 +104,7 @@
         if (!redirected) {
           try { sessionStorage.setItem("pi_redirected", "1"); } catch (e) {}
           diag("redirect_pi");
-          location.replace("/pi");
+          location.replace("/pi" + (_SANDBOX ? "?pi_sandbox=1" : ""));
           return;
         }
       }

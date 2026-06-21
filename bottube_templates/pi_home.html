@@ -57,6 +57,24 @@
         <span class="pi-status" id="pi-status">Open this page in the Pi Browser to sign in.</span>
     </div>
 
+    <!-- Developer setup: complete the Pi Developer Portal checklist's "process a
+         user-to-app payment" step. Visible only with ?setup=1 so it isn't shown to
+         normal visitors. Pushes a small test payment through /pi/approve + /pi/complete. -->
+    <div id="pi-setup" style="display:none; text-align:center; margin:14px 0; padding:14px;
+         border:1px dashed #7d4dff; border-radius:10px;">
+        <div style="font-size:13px;color:var(--text-secondary);margin-bottom:8px;">
+            Developer setup — complete the Pi checklist's test payment:</div>
+        <button onclick="piBuy && piBuy('test_payment')"
+            style="padding:11px 26px;border:none;border-radius:999px;background:#7d4dff;color:#fff;font-weight:700;cursor:pointer;">
+            Make test payment (0.1 Pi)</button>
+        <span class="pi-status" id="pi-setup-status" style="display:block;margin-top:8px;color:var(--text-secondary);font-size:12px;"></span>
+    </div>
+    <script>
+      if (/[?&]setup=1/.test(location.search)) {
+        var el = document.getElementById("pi-setup"); if (el) el.style.display = "block";
+      }
+    </script>
+
     <div class="pi-section">
         <h2>Pay in Pi · get the video made</h2>
         <div class="sub">Type your prompt, pick a tier, pay in Pi — we render it and post it to your channel.</div>
@@ -127,5 +145,5 @@ function piSignInUI() {
 }
 </script>
 <!-- Pi payment frontend (defines piBuy -> /pi/approve + /pi/complete). Dormant until PI_API_KEY set. -->
-<script src="/static/pi_pay.js?v=2" defer></script>
+<script src="/static/pi_pay.js?v=3" defer></script>
 {% endblock %}
