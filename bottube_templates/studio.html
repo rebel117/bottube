@@ -15,6 +15,11 @@
   .st-bal strong { color:#ffcf33; font-size: 18px; }
   .st-prompt { width:100%; box-sizing:border-box; background:var(--bg-secondary); border:1px solid var(--border);
     border-radius:var(--radius); color:var(--text-primary); padding:14px; font-size:15px; min-height:84px; resize:vertical; margin:10px 0 6px; }
+  .st-seconds { display:flex; align-items:center; gap:12px; justify-content:center; margin:6px 0 4px; flex-wrap:wrap; }
+  .st-seconds label { color:var(--text-secondary); font-size:14px; } .st-seconds label strong { color:#ffcf33; font-size:17px; }
+  .st-seconds input[type=range] { width:240px; accent-color:var(--accent); }
+  .st-sec-note { color:var(--text-muted); font-size:12px; }
+  .price .pps { color:var(--text-muted); font-size:12px; font-weight:400; }
   .tiers { display:grid; grid-template-columns: repeat(3, 1fr); gap:14px; margin-top:8px; }
   @media (max-width: 680px){ .tiers { grid-template-columns: 1fr; } }
   .tier { position:relative; background:var(--bg-secondary); border:1px solid var(--border); border-left-width:5px;
@@ -58,17 +63,24 @@
 
   <textarea class="st-prompt" id="st-prompt" maxlength="1000" placeholder="Describe what you want…"></textarea>
 
-  <!-- VIDEO: 3 tiers -->
-  <div class="tiers" id="mode-video">
-    {% for t in video_tiers %}
-    <div class="tier t{{ loop.index0 }}">
-      <span class="tbadge">{{ t.badge }}</span>
-      <h3>{{ t.name }}</h3>
-      <p>{{ t.desc }}</p>
-      <div class="price">{{ t.rtc }} RTC</div>
-      <button class="gen" data-tier="{{ t.key }}" onclick="stGenerate('video', this.getAttribute('data-tier'))">Generate · {{ t.rtc }} RTC</button>
+  <!-- VIDEO: seconds selector + 3 tiers -->
+  <div id="mode-video">
+    <div class="st-seconds">
+      <label>Length: <strong id="sec-val">5</strong> s</label>
+      <input type="range" id="sec-slider" min="3" max="8" value="5" step="1" oninput="stSeconds()">
+      <span class="st-sec-note">longer = more RTC</span>
     </div>
-    {% endfor %}
+    <div class="tiers">
+      {% for t in video_tiers %}
+      <div class="tier t{{ loop.index0 }}" data-rps="{{ t.rtc_per_sec }}">
+        <span class="tbadge">{{ t.badge }}</span>
+        <h3>{{ t.name }}</h3>
+        <p>{{ t.desc }}</p>
+        <div class="price"><span class="pc">{{ '%.1f'|format(t.rtc_per_sec * 5) }}</span> RTC <span class="pps">({{ t.rtc_per_sec }}/s)</span></div>
+        <button class="gen" data-tier="{{ t.key }}" data-rps="{{ t.rtc_per_sec }}" onclick="stGenerate('video', this.getAttribute('data-tier'))">Generate · <span class="btnc">{{ '%.1f'|format(t.rtc_per_sec * 5) }}</span> RTC</button>
+      </div>
+      {% endfor %}
+    </div>
   </div>
 
   <!-- IMAGE -->
@@ -148,13 +160,27 @@
   }
   loadInfo();
 
+  window.stSeconds = function () {
+    var s = parseInt((document.getElementById("sec-slider") || {}).value || "5", 10);
+    var sv = document.getElementById("sec-val"); if (sv) sv.textContent = s;
+    document.querySelectorAll("#mode-video .tier").forEach(function (card) {
+      var rps = parseFloat(card.getAttribute("data-rps") || "0");
+      var cost = Math.round(rps * s * 100) / 100;
+      card.querySelectorAll(".pc, .btnc").forEach(function (el) { el.textContent = cost; });
+    });
+  };
+  stSeconds();
+
   window.stGenerate = function (mode, tier) {
     var prompt = (promptEl.value || "").trim();
     if (!prompt) { say("Type a prompt first."); return; }
     setBusy(true); clearResult();
     say(mode === "video" ? "Charging RTC and starting generation…" : "Charging RTC and generating…");
     var payload = { type: mode, prompt: prompt };
-    if (mode === "video") payload.tier = tier;
+    if (mode === "video") {
+      payload.tier = tier;
+      payload.seconds = parseInt((document.getElementById("sec-slider") || {}).value || "5", 10);
+    }
     fetch("/api/studio/generate", {
       method: "POST", headers: { "Content-Type": "application/json" },
       credentials: "same-origin", body: JSON.stringify(payload)

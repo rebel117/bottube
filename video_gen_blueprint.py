@@ -389,6 +389,12 @@ def _try_wan(prompt: str, duration: int, final_path) -> bool:
     except Exception:
         return False
     try:
+        # duration (s) -> frame count at 16fps; Wan likes 4n+1, clamp ~1-8s
+        frames = max(17, min(129, int(duration) * 16 + 1))
+        wf["1074"]["inputs"]["length"] = frames   # EmptyHunyuanLatentVideo
+    except Exception:
+        pass
+    try:
         req = urllib.request.Request(
             f"{WAN_COMFYUI_URL}/prompt",
             data=json.dumps({"prompt": wf}).encode(),
