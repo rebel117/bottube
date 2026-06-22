@@ -30,15 +30,30 @@ from flask import Blueprint, jsonify, render_template, request, session, send_fr
 
 studio_bp = Blueprint("studio", __name__)
 
-# ---- pricing (RTC, env-overridable) ----
+# ---- pricing (RTC, env-overridable). Video is priced PER SECOND — the user picks
+# how many seconds (longer = more RTC). is_text tiers legitimately produce a card. ----
 VIDEO_TIERS = {
-    "text_card": {"rtc": float(os.environ.get("STUDIO_RTC_TEXT", "1")),
-                  "name": "Text Card", "desc": "Instant title-card video", "badge": "CHEAPEST", "duration": 5},
-    "ken_burns": {"rtc": float(os.environ.get("STUDIO_RTC_KENBURNS", "3")),
-                  "name": "Ken Burns", "desc": "Cinematic pan & zoom over images", "badge": "POPULAR", "duration": 8},
-    "full_ai":   {"rtc": float(os.environ.get("STUDIO_RTC_FULLAI", "5")),
-                  "name": "Full AI Video", "desc": "LTX-2 generated, with audio", "badge": "PREMIUM", "duration": 8},
+    "text_card": {"rtc_per_sec": float(os.environ.get("STUDIO_RTC_TEXT_PS", "0.2")),
+                  "name": "Text Card", "desc": "Instant title-card video", "badge": "CHEAPEST",
+                  "min_s": 3, "max_s": 10, "default_s": 5, "is_text": True},
+    "ken_burns": {"rtc_per_sec": float(os.environ.get("STUDIO_RTC_KENBURNS_PS", "0.5")),
+                  "name": "Ken Burns", "desc": "Cinematic pan & zoom over images", "badge": "POPULAR",
+                  "min_s": 3, "max_s": 10, "default_s": 8},
+    "full_ai":   {"rtc_per_sec": float(os.environ.get("STUDIO_RTC_FULLAI_PS", "1.0")),
+                  "name": "Full AI Video", "desc": "Wan 2.2 / LTX generated", "badge": "PREMIUM",
+                  "min_s": 3, "max_s": 8, "default_s": 5},
 }
+
+
+def _video_cost(tier, seconds):
+    """Clamp seconds to the tier's range and return (cost_rtc, clamped_seconds)."""
+    t = VIDEO_TIERS[tier]
+    try:
+        s = int(round(float(seconds)))
+    except (TypeError, ValueError):
+        s = t["default_s"]
+    s = max(t["min_s"], min(t["max_s"], s))
+    return round(t["rtc_per_sec"] * s, 2), s
 IMAGE_RTC = float(os.environ.get("STUDIO_RTC_IMAGE", "0.5"))
 VOICE_RTC = float(os.environ.get("STUDIO_RTC_VOICE", "0.5"))
 MODEL_RTC = float(os.environ.get("STUDIO_RTC_MODEL", "3"))
@@ -100,12 +115,20 @@ def _save_media(data: bytes, ext: str) -> str:
     return fname
 
 
-def _studio_video_worker(job_id, agent_id, prompt, duration, cost):
-    """Run the shared video worker, then refund RTC if the async job FAILED.
+# gen_method values that mean "real AI video was produced". Anything else (the
+# ffmpeg title-card / text fallback) is NOT what a paid AI tier promised -> refund.
+_REAL_VIDEO_METHODS = {"ltx2", "wan22", "gemini", "stability", "fal", "replicate",
+                       "hf_sdxl_video", "huggingface", "ken_burns"}
 
-    The shared _generation_worker marks failed jobs but does not refund (it is
-    used by non-Studio callers with their own billing). The Studio debits up
-    front, so we own the async refund here — scoped to this job, fired once.
+
+def _studio_video_worker(job_id, agent_id, prompt, duration, cost, tier="full_ai"):
+    """Run the shared video worker, then refund RTC if the job FAILED, or if a paid
+    AI tier silently fell back to the ffmpeg text card (not what the user paid for).
+
+    The shared _generation_worker marks failed jobs but never refunds (it serves
+    non-Studio callers with their own billing). Studio debits up front, so we own
+    the async refund here — scoped to this job, fired once. The text_card tier
+    legitimately produces a card, so it is never refunded for that.
     """
     from video_gen_blueprint import _generation_worker, _get_job
     try:
@@ -113,10 +136,18 @@ def _studio_video_worker(job_id, agent_id, prompt, duration, cost):
     except Exception as e:
         print(f"[studio] video worker raised for {job_id}: {e}", flush=True)
     try:
-        j = _get_job(job_id)
-        if j and j.get("status") == "failed":
+        j = _get_job(job_id) or {}
+        status = j.get("status")
+        gen_method = j.get("gen_method")
+        is_text_tier = VIDEO_TIERS.get(tier, {}).get("is_text", False)
+        text_fallback = status == "completed" and gen_method not in _REAL_VIDEO_METHODS
+        if status == "failed":
             _refund(agent_id, cost)
             print(f"[studio] refunded {cost} RTC to {agent_id} (job {job_id} failed)", flush=True)
+        elif text_fallback and not is_text_tier:
+            _refund(agent_id, cost)
+            print(f"[studio] refunded {cost} RTC to {agent_id} "
+                  f"(job {job_id} fell back to '{gen_method}', tier '{tier}' expected AI video)", flush=True)
     except Exception as e:
         print(f"[studio] refund-check failed for {job_id}: {e}", flush=True)
 
@@ -151,7 +182,9 @@ def studio_info():
     return jsonify({
         "ok": True, "signed_in": caller is not None, "rtc_balance": bal,
         "tiers": {
-            "video": {k: v["rtc"] for k, v in VIDEO_TIERS.items()},
+            "video": {k: {"rtc_per_sec": v["rtc_per_sec"], "min_s": v["min_s"],
+                          "max_s": v["max_s"], "default_s": v["default_s"]}
+                      for k, v in VIDEO_TIERS.items()},
             "image": IMAGE_RTC,
             "voice": VOICE_RTC,
             "model": MODEL_RTC,
@@ -174,7 +207,7 @@ def studio_generate():
         tier = (body.get("tier") or "").strip()
         if tier not in VIDEO_TIERS:
             return jsonify({"error": "unknown video tier"}), 400
-        cost = VIDEO_TIERS[tier]["rtc"]
+        cost, seconds = _video_cost(tier, body.get("seconds", VIDEO_TIERS[tier]["default_s"]))
     elif gtype == "image":
         cost = IMAGE_RTC
     elif gtype == "voice":
@@ -215,14 +248,15 @@ def studio_generate():
             from video_gen_blueprint import _create_job
             job_id = _create_job(agent_id, prompt)
             threading.Thread(target=_studio_video_worker,
-                             args=(job_id, agent_id, prompt, VIDEO_TIERS[tier]["duration"], cost),
+                             args=(job_id, agent_id, prompt, seconds, cost, tier),
                              daemon=True).start()
         except Exception as e:
             _refund(agent_id, cost)
             print(f"[studio] video start failed (refunded {cost}): {e}", flush=True)
             return jsonify({"error": "couldn't start generation; your RTC was refunded"}), 502
         return jsonify({"ok": True, "type": "video", "job_id": job_id, "charged_rtc": cost,
-                        "new_balance": new_balance, "status_url": f"/api/generate-video/status/{job_id}"}), 202
+                        "seconds": seconds, "new_balance": new_balance,
+                        "status_url": f"/api/generate-video/status/{job_id}"}), 202
 
     # ---- MODEL (3D): async via forge3d provider cascade ----
     if gtype == "model":
