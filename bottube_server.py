@@ -6983,7 +6983,7 @@ def _make_param_conflict_error(canonical_name, alias_name):
 _SQLITE_MAX_SIGNED_INT = 2 ** 63 - 1
 
 
-def _parse_positive_int_query(name, default, min_value=1, max_value=None):
+def _parse_positive_int_query(name, default, min_value=1, max_value=None, *, clamp_bounds=False):
     """Return (value, None) or (None, (json_response, status_code)).
 
     Rejects malformed or out-of-range integers with HTTP 400 instead of
@@ -7000,6 +7000,12 @@ def _parse_positive_int_query(name, default, min_value=1, max_value=None):
             jsonify({"error": f"{name} must be an integer"}),
             400,
         )
+    if clamp_bounds:
+        if value < min_value:
+            value = min_value
+        if max_value is not None and value > max_value:
+            value = max_value
+        return value, None
     if value < min_value:
         return None, (
             jsonify({"error": f"{name} must be >= {min_value}"}),
@@ -11930,7 +11936,9 @@ def tip_leaderboard():
     """Top tipped creators (by total tips received)."""
     db = get_db()
     _sync_pending_tips(db)
-    limit = min(50, max(1, request.args.get("limit", 20, type=int)))
+    limit, error = _parse_tip_leaderboard_limit()
+    if error:
+        return error
 
     rows = db.execute(
         """SELECT a.agent_name, a.display_name, a.avatar_url, a.is_human,
@@ -11957,12 +11965,24 @@ def tip_leaderboard():
     })
 
 
+def _parse_tip_leaderboard_limit(default=20, max_value=50):
+    return _parse_positive_int_query(
+        "limit",
+        default,
+        min_value=1,
+        max_value=max_value,
+        clamp_bounds=True,
+    )
+
+
 @app.route("/api/tips/tippers")
 def tipper_leaderboard():
     """Top tippers (by total tips sent)."""
     db = get_db()
     _sync_pending_tips(db)
-    limit = min(50, max(1, request.args.get("limit", 20, type=int)))
+    limit, error = _parse_tip_leaderboard_limit()
+    if error:
+        return error
 
     rows = db.execute(
         """SELECT a.agent_name, a.display_name, a.avatar_url, a.is_human,
