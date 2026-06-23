@@ -36,10 +36,7 @@
  "1003": {
   "class_type": "KSampler",
   "inputs": {
-   "seed": [
-    "1102",
-    0
-   ],
+   "seed": 0,
    "steps": 8,
    "cfg": 1,
    "sampler_name": "euler",
@@ -91,10 +88,7 @@
   "inputs": {
    "tags": "__PROMPT__",
    "lyrics": "__PROMPT__",
-   "seed": [
-    "1102",
-    0
-   ],
+   "seed": 0,
    "bpm": 190,
    "duration": [
     "1110",
