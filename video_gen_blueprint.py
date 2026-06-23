@@ -73,6 +73,94 @@ GROUNDING_VISION_URL = os.environ.get("GROUNDING_VISION_URL", os.environ.get("SO
 GROUNDING_MODEL = os.environ.get("GROUNDING_MODEL", os.environ.get("SOPHIA_MODEL", "gemma4:12b"))
 _GROUNDING_REAL = {"wan22", "wan22_i2v", "ltx2", "ken_burns"}
 
+# Optional AI audio (ACE-Step) muxed onto the video when the user toggles audio on.
+ACE_AUDIO_WORKFLOW_PATH = os.environ.get(
+    "ACE_AUDIO_WORKFLOW_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "ace_audio_api.json"))
+try:
+    with open(ACE_AUDIO_WORKFLOW_PATH) as _wf:
+        _ACE_AUDIO_WORKFLOW = json.load(_wf)
+except Exception:
+    _ACE_AUDIO_WORKFLOW = None
+
+
+def _gen_audio(prompt, duration):
+    """Run ACE-Step to generate an audio track from the prompt; return mp3 bytes or None."""
+    if not WAN_COMFYUI_URL or not _ACE_AUDIO_WORKFLOW:
+        return None
+    wf = json.loads(json.dumps(_ACE_AUDIO_WORKFLOW))
+    for v in wf.values():
+        for k, val in list(v.get("inputs", {}).items()):
+            if val == "__PROMPT__":
+                v["inputs"][k] = (prompt[:300] + ", instrumental, cinematic background")
+            if v.get("class_type") == "EmptyAceStep1.5LatentAudio" and k in ("seconds", "length"):
+                try:
+                    v["inputs"][k] = float(max(3, min(30, int(duration))))
+                except Exception:
+                    pass
+    try:
+        req = urllib.request.Request(f"{WAN_COMFYUI_URL}/prompt", data=json.dumps({"prompt": wf}).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        pid = json.loads(urllib.request.urlopen(req, timeout=20).read()).get("prompt_id")
+        if not pid:
+            return None
+    except Exception:
+        return None
+    deadline = time.time() + 240
+    outs = None
+    while time.time() < deadline:
+        time.sleep(3)
+        try:
+            hist = json.loads(urllib.request.urlopen(f"{WAN_COMFYUI_URL}/history/{pid}", timeout=10).read())
+            if pid in hist:
+                e = hist[pid]
+                if e.get("status", {}).get("completed") or e.get("outputs"):
+                    outs = e.get("outputs", {}); break
+                if e.get("status", {}).get("status_str") == "error":
+                    return None
+        except Exception:
+            continue
+    if not outs:
+        return None
+    for o in outs.values():
+        for a in o.get("audio", []) or []:
+            fn = a.get("filename")
+            if not fn:
+                continue
+            params = urllib.parse.urlencode({"filename": fn, "subfolder": a.get("subfolder", ""),
+                                             "type": a.get("type", "output")})
+            try:
+                data = urllib.request.urlopen(f"{WAN_COMFYUI_URL}/view?{params}", timeout=60).read()
+                if data and len(data) > 256:
+                    return data
+            except Exception:
+                continue
+    return None
+
+
+def _add_audio(prompt, duration, final_path):
+    """Generate AI audio and mux it onto the (silent) video. Best-effort; keeps the
+    video if anything fails."""
+    audio = _gen_audio(prompt, duration)
+    if not audio:
+        return False
+    apath = Path(final_path).with_suffix(".ace.mp3")
+    out = Path(final_path).with_suffix(".withaudio.mp4")
+    try:
+        apath.write_bytes(audio)
+        r = subprocess.run(["ffmpeg", "-y", "-i", str(final_path), "-i", str(apath),
+                            "-c:v", "copy", "-map", "0:v:0", "-map", "1:a:0", "-shortest",
+                            str(out)], capture_output=True, timeout=120)
+        if out.exists() and out.stat().st_size > 1000:
+            out.replace(final_path)
+            return True
+    except Exception as e:
+        print(f"[audio] mux failed: {e}", flush=True)
+    finally:
+        apath.unlink(missing_ok=True)
+        out.unlink(missing_ok=True)
+    return False
+
 # Free-tier video gen backends (cascade: try each in order)
 HF_API_TOKEN = os.environ.get("HF_API_TOKEN", "")
 HF_VIDEO_MODEL = os.environ.get("HF_VIDEO_MODEL", "ali-vilab/text-to-video-ms-1.7b")
@@ -1027,7 +1115,7 @@ def _grounding_verify(job_id, prompt, duration, final_path, start_image):
 
 
 def _generation_worker(job_id: str, agent_id: int, prompt: str,
-                       duration: int, category: str, title: str, start_image=None):
+                       duration: int, category: str, title: str, start_image=None, audio=False):
     """Background worker that generates the video and inserts the DB record.
 
     If start_image (bytes) is given, tries Wan image-to-video first; otherwise
@@ -1101,6 +1189,14 @@ def _generation_worker(job_id: str, agent_id: int, prompt: str,
                     gen_method = _gm
             except Exception as _ge:
                 print(f"[grounding] {job_id} error: {_ge}", flush=True)
+
+        # --- Optional AI audio: generate + mux when the user toggled audio on ---
+        if audio and gen_method in _GROUNDING_REAL and final_path.exists():
+            try:
+                if _add_audio(prompt, duration, final_path):
+                    _update_job(job_id, audio="added")
+            except Exception as _ae:
+                print(f"[audio] {job_id} error: {_ae}", flush=True)
 
         # Get video metadata
         from bottube_server import get_video_metadata, generate_thumbnail

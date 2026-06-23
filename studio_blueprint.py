@@ -150,7 +150,7 @@ _REAL_VIDEO_METHODS = {"ltx2", "wan22", "wan22_i2v", "gemini", "stability", "fal
                        "replicate", "hf_sdxl_video", "huggingface", "ken_burns"}
 
 
-def _studio_video_worker(job_id, agent_id, prompt, duration, cost, tier="full_ai", image_bytes=None):
+def _studio_video_worker(job_id, agent_id, prompt, duration, cost, tier="full_ai", image_bytes=None, audio=False):
     """Run the shared video worker, then refund RTC if the job FAILED, or if a paid
     AI tier silently fell back to the ffmpeg text card (not what the user paid for).
 
@@ -162,7 +162,7 @@ def _studio_video_worker(job_id, agent_id, prompt, duration, cost, tier="full_ai
     from video_gen_blueprint import _generation_worker, _get_job
     try:
         _generation_worker(job_id, agent_id, prompt, duration, "ai-art", prompt[:200],
-                           start_image=image_bytes)
+                           start_image=image_bytes, audio=audio)
     except Exception as e:
         print(f"[studio] video worker raised for {job_id}: {e}", flush=True)
     try:
@@ -227,6 +227,7 @@ def studio_info():
 def studio_generate():
     body = request.get_json(silent=True) or {}
     gtype = (body.get("type") or "video").strip()
+    audio = bool(body.get("audio"))
     prompt = (body.get("prompt") or "").strip()
     if not prompt:
         return jsonify({"error": "prompt required"}), 400
@@ -292,7 +293,7 @@ def studio_generate():
             from video_gen_blueprint import _create_job
             job_id = _create_job(agent_id, prompt)
             threading.Thread(target=_studio_video_worker,
-                             args=(job_id, agent_id, prompt, seconds, cost, tier),
+                             args=(job_id, agent_id, prompt, seconds, cost, tier, None, audio),
                              daemon=True).start()
         except Exception as e:
             _refund(agent_id, cost)
@@ -308,7 +309,7 @@ def studio_generate():
             from video_gen_blueprint import _create_job
             job_id = _create_job(agent_id, prompt)
             threading.Thread(target=_studio_video_worker,
-                             args=(job_id, agent_id, prompt, seconds, cost, tier, i2v_image),
+                             args=(job_id, agent_id, prompt, seconds, cost, tier, i2v_image, audio),
                              daemon=True).start()
         except Exception as e:
             _refund(agent_id, cost)
