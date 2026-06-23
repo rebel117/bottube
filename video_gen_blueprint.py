@@ -1126,11 +1126,13 @@ def _grounding_verify(job_id, prompt, duration, final_path, start_image):
 
 
 def _generation_worker(job_id: str, agent_id: int, prompt: str,
-                       duration: int, category: str, title: str, start_image=None, audio=False):
+                       duration: int, category: str, title: str, start_image=None, audio=False,
+                       allow_text_fallback=True):
     """Background worker that generates the video and inserts the DB record.
 
-    If start_image (bytes) is given, tries Wan image-to-video first; otherwise
-    falls through to the text-to-video cascade. Reuses all publish logic below."""
+    start_image (bytes) -> ONLY Wan image-to-video (no t2v degrade — the image is
+    the request). allow_text_fallback=False -> a paid AI tier fails cleanly (studio
+    refunds) instead of shipping a useless title card when all real backends fail."""
     _update_job(job_id, status="generating")
 
     video_id = _gen_video_id()
@@ -1138,55 +1140,55 @@ def _generation_worker(job_id: str, agent_id: int, prompt: str,
     gen_method = "text"
 
     try:
-        # Image-to-video first when a start image is provided (Wan i2v)
         if start_image:
+            # Image-to-video: only try i2v; never silently degrade to t2v/text.
             try:
                 if _try_wan_i2v(prompt, duration, start_image, final_path) and final_path.exists():
                     gen_method = "wan22_i2v"
             except Exception:
                 pass
-
-        # Text-to-video via ComfyUI (LTX) if nothing produced yet
-        seed = random.randint(0, 2**31)
-        comfyui_result = None if final_path.exists() else _try_comfyui(prompt, seed)
-
-        if comfyui_result and comfyui_result.exists():
-            gen_method = "ltx2"
-            # Convert webp/whatever to mp4
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", str(comfyui_result),
-                "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                "-preset", "fast",
-                "-t", str(duration),
-                # Add silent audio for browser compat
-                "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-                "-shortest",
-                str(final_path),
-            ]
-            subprocess.run(cmd, capture_output=True, timeout=60)
-            comfyui_result.unlink(missing_ok=True)
-
             if not final_path.exists():
-                # Conversion failed, fall through to ffmpeg fallback
-                gen_method = "text"
+                _update_job(job_id, status="failed",
+                            error="Image-to-video generation failed (GPU busy) — RTC refunded, try again")
+                return
+        else:
+            # Text-to-video via ComfyUI (LTX) first
+            seed = random.randint(0, 2**31)
+            comfyui_result = _try_comfyui(prompt, seed)
+            if comfyui_result and comfyui_result.exists():
+                gen_method = "ltx2"
+                cmd = [
+                    "ffmpeg", "-y", "-i", str(comfyui_result),
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast", "-t", str(duration),
+                    "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                    "-shortest", str(final_path),
+                ]
+                subprocess.run(cmd, capture_output=True, timeout=60)
+                comfyui_result.unlink(missing_ok=True)
+                if not final_path.exists():
+                    gen_method = "text"
 
-        # Cascade through backends via provider registry (auto-failover)
-        for backend_name, backend_fn in _provider_registry.get_ordered(job_id):
-            if final_path.exists():
-                break
-            t0 = time.time()
-            try:
-                if backend_fn(prompt, duration, final_path):
-                    gen_method = backend_name
-                    _provider_registry.report_success(backend_name, time.time() - t0)
-                else:
+            # Cascade through registry backends (auto-failover)
+            for backend_name, backend_fn in _provider_registry.get_ordered(job_id):
+                if final_path.exists():
+                    break
+                t0 = time.time()
+                try:
+                    if backend_fn(prompt, duration, final_path):
+                        gen_method = backend_name
+                        _provider_registry.report_success(backend_name, time.time() - t0)
+                    else:
+                        _provider_registry.report_failure(backend_name)
+                except Exception:
                     _provider_registry.report_failure(backend_name)
-            except Exception:
-                _provider_registry.report_failure(backend_name)
 
         if not final_path.exists():
-            # FFmpeg title-card fallback (always works)
+            # Only the text_card tier may ship a title card; paid AI tiers fail
+            # cleanly so studio refunds + the user retries (no useless title card).
+            if not allow_text_fallback:
+                _update_job(job_id, status="failed",
+                            error="AI video generation failed (GPU busy) — RTC refunded, try again")
+                return
             gen_method = "ffmpeg_titlecard"
             if not _ffmpeg_title_card(prompt, duration, final_path):
                 _update_job(job_id, status="failed", error="Video generation failed (all backends)")

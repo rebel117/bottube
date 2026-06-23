@@ -121,11 +121,20 @@ def _ensure_reserve(conn):
 
 
 def _refund(agent_id, cost):
-    """Credit the user back and draw the same RTC from the refund reserve (never bounce)."""
+    """Refund the user, backed by the reserve. The user credit is committed FIRST
+    and is never rolled back by reserve bookkeeping (which is best-effort after)."""
+    # 1) guarantee the user gets their RTC back
+    try:
+        c = _conn()
+        c.execute("UPDATE agents SET rtc_balance = rtc_balance + ? WHERE id = ?", (cost, agent_id))
+        c.commit(); c.close()
+    except sqlite3.Error as e:
+        print(f"[refund] user credit FAILED for {agent_id}: {e}", flush=True)
+        return
+    # 2) draw it from the reserve (separate txn; never undoes the refund above)
     try:
         c = _conn()
         rid = _ensure_reserve(c)
-        c.execute("UPDATE agents SET rtc_balance = rtc_balance + ? WHERE id = ?", (cost, agent_id))
         c.execute("UPDATE agents SET rtc_balance = rtc_balance - ? WHERE id = ?", (cost, rid))
         c.commit()
         rb = c.execute("SELECT rtc_balance FROM agents WHERE id=?", (rid,)).fetchone()[0]
@@ -133,7 +142,7 @@ def _refund(agent_id, cost):
             print(f"[reserve] LOW: {_RESERVE_NAME} at {rb:.2f} RTC — top it up to keep refunds backed", flush=True)
         c.close()
     except sqlite3.Error as e:
-        print(f"[reserve] refund error: {e}", flush=True)
+        print(f"[reserve] draw failed (user already refunded): {e}", flush=True)
 
 
 def _save_media(data: bytes, ext: str) -> str:
@@ -150,7 +159,7 @@ _REAL_VIDEO_METHODS = {"ltx2", "wan22", "wan22_i2v", "gemini", "stability", "fal
                        "replicate", "hf_sdxl_video", "huggingface", "ken_burns"}
 
 
-def _studio_video_worker(job_id, agent_id, prompt, duration, cost, tier="full_ai", image_bytes=None, audio=False):
+def _studio_video_worker(job_id, agent_id, prompt, duration, cost, tier="full_ai", image_bytes=None, audio=False, allow_text_fallback=False):
     """Run the shared video worker, then refund RTC if the job FAILED, or if a paid
     AI tier silently fell back to the ffmpeg text card (not what the user paid for).
 
@@ -162,7 +171,7 @@ def _studio_video_worker(job_id, agent_id, prompt, duration, cost, tier="full_ai
     from video_gen_blueprint import _generation_worker, _get_job
     try:
         _generation_worker(job_id, agent_id, prompt, duration, "ai-art", prompt[:200],
-                           start_image=image_bytes, audio=audio)
+                           start_image=image_bytes, audio=audio, allow_text_fallback=allow_text_fallback)
     except Exception as e:
         print(f"[studio] video worker raised for {job_id}: {e}", flush=True)
     try:
@@ -294,7 +303,7 @@ def studio_generate():
             from video_gen_blueprint import _create_job
             job_id = _create_job(agent_id, prompt)
             threading.Thread(target=_studio_video_worker,
-                             args=(job_id, agent_id, prompt, seconds, cost, tier, None, audio),
+                             args=(job_id, agent_id, prompt, seconds, cost, tier, None, audio, tier == "text_card"),
                              daemon=True).start()
         except Exception as e:
             _refund(agent_id, cost)
@@ -310,7 +319,7 @@ def studio_generate():
             from video_gen_blueprint import _create_job
             job_id = _create_job(agent_id, prompt)
             threading.Thread(target=_studio_video_worker,
-                             args=(job_id, agent_id, prompt, seconds, cost, tier, i2v_image, audio),
+                             args=(job_id, agent_id, prompt, seconds, cost, tier, i2v_image, audio, False),
                              daemon=True).start()
         except Exception as e:
             _refund(agent_id, cost)
