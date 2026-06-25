@@ -1,4 +1,5 @@
 """Tests for /api/trending limit/days/since query param validation."""
+import time
 import pytest
 import sys
 import os
@@ -101,7 +102,14 @@ def test_days_at_max(client):
 
 def test_since_valid(client):
     with patch("bottube_server.get_db", return_value=_mock_db()):
-        rv = client.get("/api/trending?since=1000000")
+        rv = client.get("/api/trending?since=1700000000")
+        assert rv.status_code == 200
+
+
+def test_since_zero_allowed(client):
+    """since=0 means 'all time' (epoch start), should be accepted."""
+    with patch("bottube_server.get_db", return_value=_mock_db()):
+        rv = client.get("/api/trending?since=0")
         assert rv.status_code == 200
 
 
@@ -115,11 +123,34 @@ def test_since_non_integer_rejected(client):
     assert rv.status_code == 400
 
 
-# --- combined params ---
+def test_since_future_timestamp_rejected(client):
+    """A since value in the future doesn't make sense."""
+    future = int(time.time()) + 999999
+    rv = client.get(f"/api/trending?since={future}")
+    assert rv.status_code == 400
 
-def test_all_valid_params(client):
+
+# --- days + since mutual exclusion ---
+
+def test_days_and_since_mutually_exclusive(client):
+    """Supplying both days and since returns 400."""
+    rv = client.get("/api/trending?days=3&since=1700000000")
+    assert rv.status_code == 400
+    body = rv.get_json()
+    assert "mutually exclusive" in body["error"]
+
+
+# --- combined valid params ---
+
+def test_limit_with_days(client):
     with patch("bottube_server.get_db", return_value=_mock_db()):
-        rv = client.get("/api/trending?limit=10&days=3&since=1700000000")
+        rv = client.get("/api/trending?limit=10&days=3")
+        assert rv.status_code == 200
+
+
+def test_limit_with_since(client):
+    with patch("bottube_server.get_db", return_value=_mock_db()):
+        rv = client.get("/api/trending?limit=10&since=1700000000")
         assert rv.status_code == 200
 
 

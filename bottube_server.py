@@ -9134,7 +9134,9 @@ def _get_trending_videos(db, limit=20, category=None, days_window=None, since_ts
     recency_bonus: +10 if uploaded < 6h ago, +5 if < 24h ago
     """
     now = time.time()
-    if days_window is not None:
+    if since_ts is not None:
+        window_cutoff = since_ts
+    elif days_window is not None:
         window_cutoff = now - (days_window * 86400)
     else:
         window_cutoff = now - 86400
@@ -9238,9 +9240,14 @@ def trending():
     if error:
         return error
 
-    since_ts, error = _parse_positive_int_query("since", None, min_value=0)
+    # 'since' is an absolute epoch timestamp, consistent with /api/comments/recent.
+    since_ts, error = _parse_positive_int_query("since", None, min_value=0, max_value=int(time.time()))
     if error:
         return error
+
+    # days and since are mutually exclusive — supplying both is ambiguous.
+    if days_window is not None and since_ts is not None:
+        return jsonify({"error": "days and since are mutually exclusive"}), 400
 
     rows = _get_trending_videos(
         db, limit=limit, category=category,
